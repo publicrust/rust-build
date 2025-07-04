@@ -160,12 +160,15 @@ public class Program
         }
         else if (path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
         {
-            // Проверяем, что проект из plugins
-            if (!path.Contains($"{Path.DirectorySeparatorChar}plugins{Path.DirectorySeparatorChar}"))
+            // Находим plugins рядом с .csproj
+            var csprojDir = Path.GetDirectoryName(path);
+            var pluginsDir = Path.Combine(csprojDir ?? string.Empty, "plugins");
+            if (!Directory.Exists(pluginsDir))
             {
-                Console.WriteLine($"Error: Only projects from 'plugins' directory can be analyzed.");
+                Console.WriteLine($"Error: 'plugins' directory not found next to {path}");
                 return;
             }
+            // Продолжаем обычный анализ — diagnostics уже фильтруются по plugins
         }
         else if (!File.Exists(path))
         {
