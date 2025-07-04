@@ -35,11 +35,11 @@ public class Program
         try
         {
             // Определяем путь к конфигу: рядом с проектом/решением, если есть, иначе дефолт
-            string configPath = null;
+            string? configPath = null;
             if (args.Length > 0)
             {
                 var inputPath = args[0];
-                string dir = Directory.Exists(inputPath)
+                string? dir = Directory.Exists(inputPath)
                     ? inputPath
                     : Path.GetDirectoryName(inputPath);
                 if (!string.IsNullOrEmpty(dir))
@@ -331,12 +331,12 @@ public class Program
                     }
                     catch (Exception)
                     {
-                        lines = null;
-                        fileContentsCache[pos.Path] = null;
+                        lines = Array.Empty<string>();
+                        fileContentsCache[pos.Path] = lines;
                     }
                 }
 
-                if (lines != null)
+                if (lines.Length > 0)
                 {
                     var errorLineIndex = pos.StartLinePosition.Line;
                     var startLine = Math.Max(0, errorLineIndex - 2);
