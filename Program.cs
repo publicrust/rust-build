@@ -34,8 +34,10 @@ public class Program
     {
         try
         {
-            // Определяем путь к конфигу: рядом с проектом/решением, если есть, иначе дефолт
+            // Определяем путь к конфигу: сначала в директории проекта, затем fallback
             string? configPath = null;
+            
+            // 1. Если указан путь к проекту/решению, ищем конфиг рядом с ним
             if (args.Length > 0)
             {
                 var inputPath = args[0];
@@ -49,20 +51,23 @@ public class Program
                         configPath = candidate;
                 }
             }
+            
+            // 2. Если конфиг не найден, ищем в директории самого проекта (AppContext.BaseDirectory)
             if (configPath == null)
             {
-                // fallback: ищем в текущей директории
-                var cwdCandidate = Path.Combine(Directory.GetCurrentDirectory(), "linter.config.json");
-                if (File.Exists(cwdCandidate))
-                    configPath = cwdCandidate;
-            }
-            if (configPath == null)
-            {
-                // fallback: AppContext.BaseDirectory
                 var baseDirCandidate = Path.Combine(AppContext.BaseDirectory, "linter.config.json");
                 if (File.Exists(baseDirCandidate))
                     configPath = baseDirCandidate;
             }
+            
+            // 3. Последний fallback: текущая рабочая директория
+            if (configPath == null)
+            {
+                var cwdCandidate = Path.Combine(Directory.GetCurrentDirectory(), "linter.config.json");
+                if (File.Exists(cwdCandidate))
+                    configPath = cwdCandidate;
+            }
+            
             if (configPath != null)
             {
                 var configJson = await File.ReadAllTextAsync(configPath);
