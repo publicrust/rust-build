@@ -110,21 +110,61 @@ public class Program
             }
             else
             {
-                // Fallback to project files
-                var projectFiles = Directory.GetFiles(path, "*.csproj");
-                if (projectFiles.Length > 0)
+                // Fallback: ищем только проекты в plugins (рекурсивно)
+                var pluginsDir = Path.Combine(path, "plugins");
+                if (!Directory.Exists(pluginsDir))
                 {
-                    if (projectFiles.Length > 1)
-                    {
-                        Console.WriteLine($"Warning: Multiple project files found. Using the first one: {Path.GetFileName(projectFiles[0])}");
-                    }
-                    path = projectFiles[0];
-                }
-                else
-                {
-                    Console.WriteLine($"Error: No solution (.sln) or project (.csproj) file found in directory: {Path.GetFullPath(path)}");
+                    Console.WriteLine($"Error: 'plugins' directory not found in {Path.GetFullPath(path)}");
                     return;
                 }
+                var pluginProjects = Directory.GetFiles(pluginsDir, "*.csproj", SearchOption.AllDirectories);
+                if (pluginProjects.Length == 0)
+                {
+                    Console.WriteLine($"Error: No .csproj files found in 'plugins' directory.");
+                    return;
+                }
+                if (pluginProjects.Length > 1)
+                {
+                    Console.WriteLine($"Warning: Multiple plugin projects found. Will analyze all:");
+                    foreach (var proj in pluginProjects)
+                        Console.WriteLine($"  - {proj}");
+                }
+                foreach (var proj in pluginProjects)
+                {
+                    await AnalyzeProject(MSBuildWorkspace.Create(), proj);
+                }
+                PrintFinalReport(true);
+                return;
+            }
+        }
+        else if (path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase))
+        {
+            // Открываем решение, но анализируем только проекты из plugins
+            using (var workspace = MSBuildWorkspace.Create())
+            {
+                var solution = await workspace.OpenSolutionAsync(path);
+                var pluginProjects = solution.Projects.Where(p => p.FilePath != null && p.FilePath.Contains($"{Path.DirectorySeparatorChar}plugins{Path.DirectorySeparatorChar}"));
+                if (!pluginProjects.Any())
+                {
+                    Console.WriteLine($"Error: No projects from 'plugins' found in solution.");
+                    return;
+                }
+                Console.WriteLine($"Found {pluginProjects.Count()} plugin projects in solution.");
+                foreach (var project in pluginProjects)
+                {
+                    await AnalyzeProjectCompilation(project);
+                }
+                PrintFinalReport(true);
+                return;
+            }
+        }
+        else if (path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+        {
+            // Проверяем, что проект из plugins
+            if (!path.Contains($"{Path.DirectorySeparatorChar}plugins{Path.DirectorySeparatorChar}"))
+            {
+                Console.WriteLine($"Error: Only projects from 'plugins' directory can be analyzed.");
+                return;
             }
         }
         else if (!File.Exists(path))
@@ -256,8 +296,13 @@ public class Program
         var compilerDiagnostics = compilation.GetDiagnostics();
         var diagnostics = analyzerDiagnostics.Concat(compilerDiagnostics);
         
+        // Фильтруем только diagnostics из plugins
         var filteredDiagnostics = diagnostics
             .Where(d => d.Severity >= DiagnosticSeverity.Warning && d.Location.IsInSource)
+            .Where(d => {
+                var filePath = d.Location.SourceTree?.FilePath;
+                return filePath != null && (filePath.Contains("/plugins/") || filePath.Contains("\\plugins\\"));
+            })
             .ToList();
 
         // Применяем логику приоритетов
