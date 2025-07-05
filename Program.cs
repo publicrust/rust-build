@@ -423,6 +423,11 @@ public class Program
             .Where(d => d.Severity >= DiagnosticSeverity.Warning && d.Location.IsInSource)
             .Where(d => {
                 var filePath = d.Location.SourceTree?.FilePath;
+                if (!string.IsNullOrEmpty(specificPluginName) && filePath != null)
+                {
+                    var isPluginFile = filePath.Contains($"{Path.DirectorySeparatorChar}plugins{Path.DirectorySeparatorChar}{specificPluginName}{Path.DirectorySeparatorChar}");
+                    return isPluginFile;
+                }
                 return filePath != null && (filePath.Contains("/plugins/") || filePath.Contains("\\plugins\\"));
             })
             .ToList();
