@@ -8,7 +8,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>rust-build</ToolCommandName>
     <PackageId>rust-build</PackageId>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Authors>your-name</Authors>
     <Description>Static analyzer for Rust plugins in C# projects. Only analyzes files in plugins/.</Description>
     <PackageTags>analyzer;rust;oxide;plugins;tool</PackageTags>
