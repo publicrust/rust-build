@@ -29,6 +29,8 @@ public class PriorityLevel
 public class Program
 {
     private static LinterConfig _config = new LinterConfig();
+    private static readonly Dictionary<string, int> _pluginErrorCount = new();
+    private static string _pluginsRoot = string.Empty;
     
     static async Task Main(string[] args)
     {
@@ -112,6 +114,7 @@ public class Program
             {
                 // Fallback: ищем только проекты в plugins (рекурсивно)
                 var pluginsDir = Path.Combine(path, "plugins");
+                _pluginsRoot = pluginsDir;
                 if (!Directory.Exists(pluginsDir))
                 {
                     Console.WriteLine($"Error: 'plugins' directory not found in {Path.GetFullPath(path)}");
@@ -134,6 +137,11 @@ public class Program
                     await AnalyzeProject(MSBuildWorkspace.Create(), proj);
                 }
                 PrintFinalReport(true);
+                
+                // Автоматический мердж partial-классов после анализа
+                var buildDir = Path.Combine(path, "build");
+                Directory.CreateDirectory(buildDir);
+                MergeAllPlugins(pluginsDir, buildDir);
                 return;
             }
         }
@@ -155,6 +163,16 @@ public class Program
                     await AnalyzeProjectCompilation(project);
                 }
                 PrintFinalReport(true);
+                
+                // Теперь мерджим только плагины без ошибок
+                var solutionDir = Path.GetDirectoryName(path);
+                var solutionPluginsDir = Path.Combine(solutionDir ?? string.Empty, "plugins");
+                if (Directory.Exists(solutionPluginsDir))
+                {
+                    var buildDir = Path.Combine(solutionDir ?? string.Empty, "build");
+                    Directory.CreateDirectory(buildDir);
+                    MergeAllPlugins(solutionPluginsDir, buildDir);
+                }
                 return;
             }
         }
@@ -163,6 +181,7 @@ public class Program
             // Находим plugins рядом с .csproj
             var csprojDir = Path.GetDirectoryName(path);
             var pluginsDir = Path.Combine(csprojDir ?? string.Empty, "plugins");
+            _pluginsRoot = pluginsDir;
             if (!Directory.Exists(pluginsDir))
             {
                 Console.WriteLine($"Error: 'plugins' directory not found next to {path}");
@@ -215,6 +234,15 @@ public class Program
                 Console.WriteLine($"An error occurred during analysis: {ex.Message}");
             }
         }
+
+        // Автоматический мердж partial-классов (если есть plugins)
+        var currentDir = Directory.GetCurrentDirectory();
+        var currentPluginsDir = Path.Combine(currentDir, "plugins");
+        _pluginsRoot = currentPluginsDir;
+        if (Directory.Exists(currentPluginsDir))
+        {
+            // Анализ будет выполнен позже, мердж будет после анализа
+        }
     }
 
     private static async Task AnalyzeSolution(MSBuildWorkspace workspace, string solutionPath)
@@ -235,6 +263,16 @@ public class Program
         }
 
         PrintFinalReport(anyIssuesFound);
+        
+        // Теперь мерджим только плагины без ошибок
+        var solutionDir = Path.GetDirectoryName(solutionPath);
+        var pluginsDir = Path.Combine(solutionDir ?? string.Empty, "plugins");
+        if (Directory.Exists(pluginsDir))
+        {
+            var buildDir = Path.Combine(solutionDir ?? string.Empty, "build");
+            Directory.CreateDirectory(buildDir);
+            MergeAllPlugins(pluginsDir, buildDir);
+        }
     }
 
     private static async Task AnalyzeProject(MSBuildWorkspace workspace, string projectPath)
@@ -246,6 +284,16 @@ public class Program
         var (hasErrors, hasWarnings) = await AnalyzeProjectCompilation(project);
 
         PrintFinalReport(hasErrors || hasWarnings);
+        
+        // Теперь мерджим только плагины без ошибок
+        var projectDir = Path.GetDirectoryName(projectPath);
+        var pluginsDir = Path.Combine(projectDir ?? string.Empty, "plugins");
+        if (Directory.Exists(pluginsDir))
+        {
+            var buildDir = Path.Combine(projectDir ?? string.Empty, "build");
+            Directory.CreateDirectory(buildDir);
+            MergeAllPlugins(pluginsDir, buildDir);
+        }
     }
 
     private static async Task<(bool hasErrors, bool hasWarnings)> AnalyzeProjectCompilation(Project project)
@@ -307,6 +355,19 @@ public class Program
                 return filePath != null && (filePath.Contains("/plugins/") || filePath.Contains("\\plugins\\"));
             })
             .ToList();
+
+        // Считаем ошибки по каждому плагину
+        foreach (var diag in filteredDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error))
+        {
+            var filePath = diag.Location.SourceTree?.FilePath;
+            if (filePath == null || string.IsNullOrEmpty(_pluginsRoot)) continue;
+            var idx = filePath.IndexOf(Path.DirectorySeparatorChar + "plugins" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) continue;
+            var relative = filePath.Substring(idx + ("/plugins/".Length));
+            var pluginName = relative.Split(Path.DirectorySeparatorChar)[0];
+            if (!_pluginErrorCount.ContainsKey(pluginName)) _pluginErrorCount[pluginName] = 0;
+            _pluginErrorCount[pluginName]++;
+        }
 
         // Применяем логику приоритетов
         var issueFound = false;
@@ -431,5 +492,66 @@ public class Program
              Console.WriteLine("Analysis finished. No errors or warnings found.");
              Console.ResetColor();
         }
+    }
+
+    // Мердж partial-классов для одного плагина
+    static void MergePluginPartials(string srcDir, string output)
+    {
+        var trees = Directory.GetFiles(srcDir, "*.cs", SearchOption.AllDirectories)
+            .Select(f => Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(File.ReadAllText(f))).ToList();
+        // ➊ собрать уникальные using-директивы
+        var usings = trees.SelectMany(t => ((Microsoft.CodeAnalysis.CSharp.Syntax.CompilationUnitSyntax)t.GetRoot()).Usings)
+            .Distinct(new UsingComparer())
+            .Select(u => u.ToFullString());
+        // ➋ найти все partial-класс(ы) верхнего уровня
+        var partials = trees.SelectMany(t => t.GetRoot()
+                .DescendantNodes()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax>()
+                .Where(c => c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword))))
+            .GroupBy(c => (c.Identifier.Text, NamespaceOf(c)))
+            .ToList();
+        // ➌ объединить тела
+        var result = string.Join(Environment.NewLine, usings) + "\n\n";
+        foreach (var group in partials)
+        {
+            var (className, ns) = group.Key;
+            result += $"namespace {ns}\n{{\n    public class {className}\n    {{\n";
+            foreach (var part in group)
+                result += string.Join("", part.Members.Select(m => m.ToFullString())) + "\n";
+            result += "    }\n}\n";
+        }
+        File.WriteAllText(output, result);
+        Console.WriteLine($"[merge-plugin] {srcDir} → {output}");
+    }
+    static string? NamespaceOf(Microsoft.CodeAnalysis.SyntaxNode node) =>
+        node.Ancestors().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.NamespaceDeclarationSyntax>().FirstOrDefault()?.Name.ToString();
+    class UsingComparer : IEqualityComparer<Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax>
+    {
+        public bool Equals(Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax? x, Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax? y)
+            => x?.Name.ToString() == y?.Name.ToString();
+        public int GetHashCode(Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax obj) => obj.Name.ToString().GetHashCode();
+    }
+
+    // Мердж всех плагинов из plugins в build
+    static void MergeAllPlugins(string pluginsDir, string buildDir)
+    {
+        var pluginDirs = Directory.GetDirectories(pluginsDir, "*", SearchOption.AllDirectories)
+            .Where(d => Directory.GetFiles(d, "*.cs").Any()).ToList();
+        
+        foreach (var pluginDir in pluginDirs)
+        {
+            var relativePath = Path.GetRelativePath(pluginsDir, pluginDir);
+            var pluginName = relativePath.Replace(Path.DirectorySeparatorChar, '_');
+            if (_pluginErrorCount.TryGetValue(pluginName, out var errCount) && errCount > 0)
+            {
+                Console.WriteLine($"[merge-plugin] SKIP {pluginName}: {errCount} error(s)");
+                continue;
+            }
+            var outputFile = Path.Combine(buildDir, $"{pluginName}.cs");
+            MergePluginPartials(pluginDir, outputFile);
+        }
+        
+        if (pluginDirs.Any())
+            Console.WriteLine($"[merge-plugin] All plugins merged to {buildDir}");
     }
 }

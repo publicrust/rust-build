@@ -348,7 +348,7 @@ FodyWeavers.xsd
 *.msp
 
 # JetBrains Rider
-*.sln.iml
+*.sln.iml 
 
 # User-specific linter configuration
 linter.config.json 
