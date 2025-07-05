@@ -13,6 +13,7 @@ using Microsoft.CodeAnalysis.MSBuild;
 using System.Collections.Immutable;
 using System.Collections.Generic;
 using Newtonsoft.Json;
+using System.Text;
 
 public class LinterConfig
 {
@@ -34,6 +35,76 @@ public class Program
     
     static async Task Main(string[] args)
     {
+        // Обработка аргументов: путь до .csproj и имя плагина
+        string? projectPath = null;
+        string? pluginName = null;
+        
+        // Обработка аргумента --project
+        int projectArgIndex = Array.IndexOf(args, "--project");
+        if (projectArgIndex >= 0 && projectArgIndex + 1 < args.Length)
+        {
+            projectPath = args[projectArgIndex + 1];
+            
+            // Создаем новый массив аргументов без --project и его значения
+            var newArgs = new List<string>();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (i != projectArgIndex && i != projectArgIndex + 1)
+                {
+                    newArgs.Add(args[i]);
+                }
+            }
+            args = newArgs.ToArray();
+        }
+        
+        if (args.Length > 0)
+        {
+            // Если первый аргумент заканчивается на .csproj или .sln, это путь к проекту
+            if (args[0].EndsWith(".csproj", StringComparison.OrdinalIgnoreCase) || 
+                args[0].EndsWith(".sln", StringComparison.OrdinalIgnoreCase) ||
+                Directory.Exists(args[0]))
+            {
+                projectPath = args[0];
+                
+                // Если есть второй аргумент, это имя плагина
+                if (args.Length > 1)
+                {
+                    pluginName = args[1];
+                }
+            }
+            // Иначе первый аргумент - это имя плагина
+            else
+            {
+                pluginName = args[0];
+                // Проект ищем в текущей директории, если он не был указан через --project
+                if (projectPath == null)
+                {
+                    var csprojFiles = Directory.GetFiles(Directory.GetCurrentDirectory(), "*.csproj");
+                    if (csprojFiles.Length > 0)
+                    {
+                        projectPath = csprojFiles[0];
+                        if (csprojFiles.Length > 1)
+                        {
+                            Console.WriteLine($"Warning: Multiple .csproj files found in current directory. Using: {Path.GetFileName(projectPath)}");
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Если не указан путь к проекту, используем текущую директорию
+        if (projectPath == null)
+        {
+            projectPath = Directory.GetCurrentDirectory();
+        }
+
+        // Выводим информацию о параметрах запуска
+        Console.WriteLine($"Project path: {projectPath}");
+        if (!string.IsNullOrEmpty(pluginName))
+        {
+            Console.WriteLine($"Building plugin: {pluginName}");
+        }
+
         try
         {
             // Определяем путь к конфигу: сначала в директории проекта, затем fallback
@@ -87,14 +158,14 @@ public class Program
         }
 
         string path;
-        if (args.Length == 0)
+        if (projectPath == Directory.GetCurrentDirectory() && !Directory.Exists(Path.Combine(projectPath, "plugins")))
         {
-            path = Directory.GetCurrentDirectory();
-            Console.WriteLine($"No path provided, using current directory: {Path.GetFullPath(path)}");
+            path = projectPath;
+            Console.WriteLine($"Using directory: {Path.GetFullPath(path)}");
         }
         else
         {
-            path = args[0];
+            path = projectPath;
         }
 
         // If the provided path is a directory, find a solution or project file within it.
@@ -134,14 +205,14 @@ public class Program
                 }
                 foreach (var proj in pluginProjects)
                 {
-                    await AnalyzeProject(MSBuildWorkspace.Create(), proj);
+                    await AnalyzeProject(MSBuildWorkspace.Create(), proj, pluginName);
                 }
                 PrintFinalReport(true);
                 
                 // Автоматический мердж partial-классов после анализа
                 var buildDir = Path.Combine(path, "build");
                 Directory.CreateDirectory(buildDir);
-                MergeAllPlugins(pluginsDir, buildDir);
+                MergeAllPlugins(pluginsDir, buildDir, pluginName);
                 return;
             }
         }
@@ -160,7 +231,7 @@ public class Program
                 Console.WriteLine($"Found {pluginProjects.Count()} plugin projects in solution.");
                 foreach (var project in pluginProjects)
                 {
-                    await AnalyzeProjectCompilation(project);
+                    await AnalyzeProjectCompilation(project, pluginName);
                 }
                 PrintFinalReport(true);
                 
@@ -171,7 +242,7 @@ public class Program
                 {
                     var buildDir = Path.Combine(solutionDir ?? string.Empty, "build");
                     Directory.CreateDirectory(buildDir);
-                    MergeAllPlugins(solutionPluginsDir, buildDir);
+                    MergeAllPlugins(solutionPluginsDir, buildDir, pluginName);
                 }
                 return;
             }
@@ -222,11 +293,11 @@ public class Program
                 var isSolution = path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase);
                 if (isSolution)
                 {
-                    await AnalyzeSolution(workspace, path);
+                    await AnalyzeSolution(workspace, path, pluginName);
                 }
                 else
                 {
-                    await AnalyzeProject(workspace, path);
+                    await AnalyzeProject(workspace, path, pluginName);
                 }
             }
             catch (Exception ex)
@@ -245,7 +316,7 @@ public class Program
         }
     }
 
-    private static async Task AnalyzeSolution(MSBuildWorkspace workspace, string solutionPath)
+    private static async Task AnalyzeSolution(MSBuildWorkspace workspace, string solutionPath, string? pluginName = null)
     {
         var solution = await workspace.OpenSolutionAsync(solutionPath);
         Console.WriteLine($"Solution loaded successfully. Projects: {solution.Projects.Count()}");
@@ -255,7 +326,7 @@ public class Program
 
         foreach (var project in solution.Projects)
         {
-            var (hasErrors, hasWarnings) = await AnalyzeProjectCompilation(project);
+            var (hasErrors, hasWarnings) = await AnalyzeProjectCompilation(project, pluginName);
             if (hasErrors || hasWarnings)
             {
                 anyIssuesFound = true;
@@ -271,17 +342,17 @@ public class Program
         {
             var buildDir = Path.Combine(solutionDir ?? string.Empty, "build");
             Directory.CreateDirectory(buildDir);
-            MergeAllPlugins(pluginsDir, buildDir);
+            MergeAllPlugins(pluginsDir, buildDir, pluginName);
         }
     }
 
-    private static async Task AnalyzeProject(MSBuildWorkspace workspace, string projectPath)
+    private static async Task AnalyzeProject(MSBuildWorkspace workspace, string projectPath, string? pluginName = null)
     {
         var project = await workspace.OpenProjectAsync(projectPath);
         Console.WriteLine($"Project loaded successfully: {project.Name}");
         Console.WriteLine("----------------------------------------------------");
         
-        var (hasErrors, hasWarnings) = await AnalyzeProjectCompilation(project);
+        var (hasErrors, hasWarnings) = await AnalyzeProjectCompilation(project, pluginName);
 
         PrintFinalReport(hasErrors || hasWarnings);
         
@@ -292,11 +363,11 @@ public class Program
         {
             var buildDir = Path.Combine(projectDir ?? string.Empty, "build");
             Directory.CreateDirectory(buildDir);
-            MergeAllPlugins(pluginsDir, buildDir);
+            MergeAllPlugins(pluginsDir, buildDir, pluginName);
         }
     }
 
-    private static async Task<(bool hasErrors, bool hasWarnings)> AnalyzeProjectCompilation(Project project)
+    private static async Task<(bool hasErrors, bool hasWarnings)> AnalyzeProjectCompilation(Project project, string? specificPluginName = null)
     {
         Console.WriteLine($"\nAnalyzing project: {project.Name}");
 
@@ -533,10 +604,24 @@ public class Program
     }
 
     // Мердж всех плагинов из plugins в build
-    static void MergeAllPlugins(string pluginsDir, string buildDir)
+    static void MergeAllPlugins(string pluginsDir, string buildDir, string? specificPluginName = null)
     {
         var pluginDirs = Directory.GetDirectories(pluginsDir, "*", SearchOption.AllDirectories)
             .Where(d => Directory.GetFiles(d, "*.cs").Any()).ToList();
+        
+        // Если указано конкретное имя плагина, фильтруем только его
+        if (!string.IsNullOrEmpty(specificPluginName))
+        {
+            pluginDirs = pluginDirs
+                .Where(d => Path.GetFileName(d).Equals(specificPluginName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            
+            if (pluginDirs.Count == 0)
+            {
+                Console.WriteLine($"Error: Plugin '{specificPluginName}' not found in {pluginsDir}");
+                return;
+            }
+        }
         
         foreach (var pluginDir in pluginDirs)
         {
