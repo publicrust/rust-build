@@ -594,7 +594,7 @@ public class Program
             foreach (var cls in nonPartialClasses)
             {
                 var filePath = cls.SyntaxTree.FilePath;
-                var fileName = Path.GetFileName(filePath);
+                var fileName = string.IsNullOrEmpty(filePath) ? "<unknown file>" : Path.GetFileName(filePath);
                 Console.WriteLine($"  - Class '{cls.Identifier}' in {fileName} is missing 'partial' modifier");
             }
             Console.WriteLine("  All classes must have 'partial' modifier to be merged properly.");
