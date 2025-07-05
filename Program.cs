@@ -576,6 +576,38 @@ public class Program
     {
         var trees = Directory.GetFiles(srcDir, "*.cs", SearchOption.AllDirectories)
             .Select(f => Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(File.ReadAllText(f))).ToList();
+
+        // Проверяем, что все классы имеют модификатор partial
+        var allClasses = trees.SelectMany(t => t.GetRoot()
+                .DescendantNodes()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax>())
+            .ToList();
+
+        var nonPartialClasses = allClasses
+            .Where(c => !c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword)))
+            .ToList();
+
+        if (nonPartialClasses.Any())
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[merge-plugin] ERROR: Found non-partial classes in {Path.GetFileName(srcDir)}:");
+            foreach (var cls in nonPartialClasses)
+            {
+                var filePath = cls.SyntaxTree.FilePath;
+                var fileName = Path.GetFileName(filePath);
+                Console.WriteLine($"  - Class '{cls.Identifier}' in {fileName} is missing 'partial' modifier");
+            }
+            Console.WriteLine("  All classes must have 'partial' modifier to be merged properly.");
+            Console.ResetColor();
+            
+            // Добавляем ошибку для этого плагина
+            var pluginName = Path.GetFileName(srcDir);
+            if (!_pluginErrorCount.ContainsKey(pluginName)) _pluginErrorCount[pluginName] = 0;
+            _pluginErrorCount[pluginName] += nonPartialClasses.Count;
+            
+            return;
+        }
+        
         // ➊ собрать уникальные using-директивы
         var usings = trees.SelectMany(t => ((Microsoft.CodeAnalysis.CSharp.Syntax.CompilationUnitSyntax)t.GetRoot()).Usings)
             .Distinct(new UsingComparer())
