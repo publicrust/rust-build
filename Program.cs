@@ -423,6 +423,7 @@ public class Program
             .Where(d => d.Severity >= DiagnosticSeverity.Warning && d.Location.IsInSource)
             .Where(d => {
                 var filePath = d.Location.SourceTree?.FilePath;
+                // Если указан конкретный плагин, проверяем, что файл относится к этому плагину
                 if (!string.IsNullOrEmpty(specificPluginName) && filePath != null)
                 {
                     var isPluginFile = filePath.Contains($"{Path.DirectorySeparatorChar}plugins{Path.DirectorySeparatorChar}{specificPluginName}{Path.DirectorySeparatorChar}");
@@ -632,6 +633,12 @@ public class Program
         {
             var relativePath = Path.GetRelativePath(pluginsDir, pluginDir);
             var pluginName = relativePath.Replace(Path.DirectorySeparatorChar, '_');
+            // Если указан конкретный плагин и это не тот плагин, пропускаем
+            if (!string.IsNullOrEmpty(specificPluginName) && 
+                !pluginName.Equals(specificPluginName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
             if (_pluginErrorCount.TryGetValue(pluginName, out var errCount) && errCount > 0)
             {
                 Console.WriteLine($"[merge-plugin] SKIP {pluginName}: {errCount} error(s)");
