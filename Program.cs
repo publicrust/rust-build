@@ -583,21 +583,36 @@ public class Program
                 .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax>())
             .ToList();
 
-        var nonPartialClasses = allClasses
+        // Находим только основные классы плагинов (наследуемые от RustPlugin или CovalencePlugin)
+        var pluginClasses = allClasses
+            .Where(c => c.BaseList != null && c.BaseList.Types.Any(t => 
+                t.ToString().Contains("RustPlugin") || t.ToString().Contains("CovalencePlugin")))
+            .ToList();
+        
+        // Если не нашли ни одного класса плагина, берем все public классы
+        if (!pluginClasses.Any())
+        {
+            pluginClasses = allClasses
+                .Where(c => c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PublicKeyword)))
+                .ToList();
+        }
+        
+        // Проверяем, что основные классы плагинов имеют модификатор partial
+        var nonPartialClasses = pluginClasses
             .Where(c => !c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword)))
             .ToList();
 
         if (nonPartialClasses.Any())
         {
             Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine($"[merge-plugin] ERROR: Found non-partial classes in {Path.GetFileName(srcDir)}:");
+            Console.WriteLine($"[merge-plugin] ERROR: Found non-partial plugin classes in {Path.GetFileName(srcDir)}:");
             foreach (var cls in nonPartialClasses)
             {
                 var filePath = cls.SyntaxTree.FilePath;
                 var fileName = string.IsNullOrEmpty(filePath) ? "<unknown file>" : Path.GetFileName(filePath);
-                Console.WriteLine($"  - Class '{cls.Identifier}' in {fileName} is missing 'partial' modifier");
+                Console.WriteLine($"  - Plugin class '{cls.Identifier}' in {fileName} is missing 'partial' modifier");
             }
-            Console.WriteLine("  All classes must have 'partial' modifier to be merged properly.");
+            Console.WriteLine("  All plugin classes must have 'partial' modifier to be merged properly.");
             Console.ResetColor();
             
             // Добавляем ошибку для этого плагина
