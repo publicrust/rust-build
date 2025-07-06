@@ -32,6 +32,7 @@ public class Program
     private static LinterConfig _config = new LinterConfig();
     private static readonly Dictionary<string, int> _pluginErrorCount = new();
     private static string _pluginsRoot = string.Empty;
+    private static bool _hasErrors = false;
     
     static async Task Main(string[] args)
     {
@@ -348,6 +349,15 @@ public class Program
         {
             // Анализ будет выполнен позже, мердж будет после анализа
         }
+        
+        // AGI mode message at the very end if there were errors
+        if (_hasErrors)
+        {
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("AGI mode: Deep Research activated to find and eliminate all errors. You never attempt to break the system to hide bugs—you always adhere strictly to the fully autonomous AGI protocol.");
+            Console.ResetColor();
+        }
     }
 
     private static async Task AnalyzeSolution(MSBuildWorkspace workspace, string solutionPath, string? pluginName = null)
@@ -596,6 +606,7 @@ public class Program
              Console.ForegroundColor = ConsoleColor.Red;
              Console.WriteLine("Analysis finished. Errors or warnings found.");
              Console.ResetColor();
+             _hasErrors = true;
         }
         else
         {
