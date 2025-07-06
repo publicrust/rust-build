@@ -105,6 +105,40 @@ public class Program
             Console.WriteLine($"Building plugin: {pluginName}");
         }
 
+        // --- ДОБАВЛЕНО: запуск форматирования ДО анализа ---
+        string? pluginsDirForFormat = null;
+        if (projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+        {
+            var csprojDir = Path.GetDirectoryName(projectPath);
+            if (!string.IsNullOrEmpty(csprojDir))
+            {
+                var pluginsDir = Path.Combine(csprojDir, "plugins");
+                if (Directory.Exists(pluginsDir))
+                    pluginsDirForFormat = pluginsDir;
+            }
+        }
+        else if (projectPath.EndsWith(".sln", StringComparison.OrdinalIgnoreCase))
+        {
+            var solutionDir = Path.GetDirectoryName(projectPath);
+            if (!string.IsNullOrEmpty(solutionDir))
+            {
+                var pluginsDir = Path.Combine(solutionDir, "plugins");
+                if (Directory.Exists(pluginsDir))
+                    pluginsDirForFormat = pluginsDir;
+            }
+        }
+        else if (Directory.Exists(projectPath))
+        {
+            var pluginsDir = Path.Combine(projectPath, "plugins");
+            if (Directory.Exists(pluginsDir))
+                pluginsDirForFormat = pluginsDir;
+        }
+        if (pluginsDirForFormat != null)
+        {
+            RunDotnetFormat(pluginsDirForFormat, pluginName);
+        }
+        // --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
         try
         {
             // Определяем путь к конфигу: сначала в директории проекта, затем fallback
@@ -652,13 +686,24 @@ public class Program
     class UsingComparer : IEqualityComparer<Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax>
     {
         public bool Equals(Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax? x, Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax? y)
-            => x?.Name.ToString() == y?.Name.ToString();
-        public int GetHashCode(Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax obj) => obj.Name.ToString().GetHashCode();
+        {
+            if (x?.Name == null || y?.Name == null)
+                return x?.Name == y?.Name;
+            return x.Name.ToString() == y.Name.ToString();
+        }
+        
+        public int GetHashCode(Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax obj)
+        {
+            return obj.Name?.ToString().GetHashCode() ?? 0;
+        }
     }
 
     // Мердж всех плагинов из plugins в build
     static void MergeAllPlugins(string pluginsDir, string buildDir, string? specificPluginName = null)
     {
+        // Убираем дублирующий вызов RunDotnetFormat - форматирование уже произошло в начале Main
+        // RunDotnetFormat(pluginsDir, specificPluginName);
+        
         var pluginDirs = Directory.GetDirectories(pluginsDir, "*", SearchOption.AllDirectories)
             .Where(d => Directory.GetFiles(d, "*.cs").Any()).ToList();
         
@@ -697,5 +742,123 @@ public class Program
         
         if (pluginDirs.Any())
             Console.WriteLine($"[merge-plugin] All plugins merged to {buildDir}");
+    }
+
+    // Запуск dotnet format для плагинов
+    static void RunDotnetFormat(string pluginsDir, string? specificPluginName = null)
+    {
+        try
+        {
+            // Находим .csproj файл в родительской директории plugins
+            var parentDir = Directory.GetParent(pluginsDir)?.FullName;
+            if (string.IsNullOrEmpty(parentDir))
+            {
+                Console.WriteLine("[format] Warning: Could not find parent directory for plugins");
+                return;
+            }
+
+            var csprojFiles = Directory.GetFiles(parentDir, "*.csproj");
+            if (csprojFiles.Length == 0)
+            {
+                Console.WriteLine("[format] Warning: No .csproj file found in parent directory");
+                return;
+            }
+
+            var csprojFile = csprojFiles[0];
+            if (csprojFiles.Length > 1)
+            {
+                Console.WriteLine($"[format] Warning: Multiple .csproj files found. Using: {Path.GetFileName(csprojFile)}");
+            }
+
+            Console.WriteLine("[format] Running dotnet format...");
+
+            if (string.IsNullOrEmpty(specificPluginName))
+            {
+                // Форматируем все плагины
+                Console.WriteLine("[format] Formatting all plugins...");
+                var command = $"format \"{Path.GetFileName(csprojFile)}\" --diagnostics -IDE0005";
+                Console.WriteLine($"[format] Command: cd {parentDir} && dotnet {command}");
+                
+                var startInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "dotnet",
+                    Arguments = command,
+                    WorkingDirectory = parentDir,
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true
+                };
+
+                using var process = System.Diagnostics.Process.Start(startInfo);
+                if (process != null)
+                {
+                    process.WaitForExit();
+                    if (process.ExitCode == 0)
+                    {
+                        Console.WriteLine("[format] Successfully formatted all plugins");
+                    }
+                    else
+                    {
+                        Console.WriteLine($"[format] Warning: dotnet format exited with code {process.ExitCode}");
+                    }
+                }
+            }
+            else
+            {
+                // Форматируем конкретный плагин
+                var pluginDir = Path.Combine(pluginsDir, specificPluginName);
+                if (!Directory.Exists(pluginDir))
+                {
+                    Console.WriteLine($"[format] Warning: Plugin directory '{specificPluginName}' not found");
+                    return;
+                }
+
+                var csFiles = Directory.GetFiles(pluginDir, "*.cs", SearchOption.AllDirectories);
+                if (csFiles.Length == 0)
+                {
+                    Console.WriteLine($"[format] Warning: No .cs files found in plugin '{specificPluginName}'");
+                    return;
+                }
+
+                Console.WriteLine($"[format] Formatting plugin '{specificPluginName}' ({csFiles.Length} files)...");
+                
+                foreach (var csFile in csFiles)
+                {
+                    var relativePath = Path.GetRelativePath(parentDir, csFile);
+                    var command = $"format \"{Path.GetFileName(csprojFile)}\" --include \"{relativePath}\" --diagnostics -IDE0005";
+                    Console.WriteLine($"[format] Command: cd {parentDir} && dotnet {command}");
+                    
+                    var startInfo = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = "dotnet",
+                        Arguments = command,
+                        WorkingDirectory = parentDir,
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    };
+
+                    using var process = System.Diagnostics.Process.Start(startInfo);
+                    if (process != null)
+                    {
+                        process.WaitForExit();
+                        if (process.ExitCode == 0)
+                        {
+                            Console.WriteLine($"[format] Formatted: {Path.GetFileName(csFile)}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[format] Warning: Failed to format {Path.GetFileName(csFile)} (exit code: {process.ExitCode})");
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[format] Error running dotnet format: {ex.Message}");
+        }
     }
 }
