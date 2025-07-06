@@ -146,7 +146,21 @@ public class Program
             string? configPath = null;
             
             // 1. Если указан путь к проекту/решению, ищем конфиг рядом с ним
-            if (args.Length > 0)
+            if (projectPath != null)
+            {
+                string? dir = Directory.Exists(projectPath)
+                    ? projectPath
+                    : Path.GetDirectoryName(projectPath);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    var candidate = Path.Combine(dir, "linter.config.json");
+                    if (File.Exists(candidate))
+                        configPath = candidate;
+                }
+            }
+            
+            // 2. Если конфиг не найден и есть аргументы, ищем в директории первого аргумента
+            if (configPath == null && args.Length > 0)
             {
                 var inputPath = args[0];
                 string? dir = Directory.Exists(inputPath)
@@ -160,7 +174,7 @@ public class Program
                 }
             }
             
-            // 2. Если конфиг не найден, ищем в директории самого проекта (AppContext.BaseDirectory)
+            // 3. Если конфиг не найден, ищем в директории самого проекта (AppContext.BaseDirectory)
             if (configPath == null)
             {
                 var baseDirCandidate = Path.Combine(AppContext.BaseDirectory, "linter.config.json");
@@ -168,7 +182,7 @@ public class Program
                     configPath = baseDirCandidate;
             }
             
-            // 3. Последний fallback: текущая рабочая директория
+            // 4. Последний fallback: текущая рабочая директория
             if (configPath == null)
             {
                 var cwdCandidate = Path.Combine(Directory.GetCurrentDirectory(), "linter.config.json");
@@ -200,7 +214,7 @@ public class Program
         }
         else
         {
-            path = projectPath;
+            path = projectPath ?? Directory.GetCurrentDirectory();
         }
 
         // If the provided path is a directory, find a solution or project file within it.
@@ -251,7 +265,7 @@ public class Program
                 return;
             }
         }
-        else if (path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase))
+        else if (path != null && path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase))
         {
             // Открываем решение, но анализируем только проекты из plugins
             using (var workspace = MSBuildWorkspace.Create())
@@ -282,7 +296,7 @@ public class Program
                 return;
             }
         }
-        else if (path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+        else if (path != null && path.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
         {
             // Находим plugins рядом с .csproj
             var csprojDir = Path.GetDirectoryName(path);
@@ -295,7 +309,7 @@ public class Program
             }
             // Продолжаем обычный анализ — diagnostics уже фильтруются по plugins
         }
-        else if (!File.Exists(path))
+        else if (path != null && !File.Exists(path))
         {
             Console.WriteLine($"Error: The specified file or directory does not exist: {path}");
             return;
@@ -325,7 +339,7 @@ public class Program
 
             try
             {
-                var isSolution = path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase);
+                var isSolution = path != null && path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase);
                 if (isSolution)
                 {
                     await AnalyzeSolution(workspace, path, pluginName);
