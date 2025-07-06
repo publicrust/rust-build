@@ -517,6 +517,7 @@ public class Program
 
             if (levelDiagnostics.Any())
             {
+                Console.WriteLine($"\nDisplaying issues for Level {level.Level}: {level.Name}");
                 DisplayDiagnostics(levelDiagnostics);
                 issueFound = true;
                 break; 
@@ -533,7 +534,7 @@ public class Program
             
             if (unprioritizedDiagnostics.Any())
             {
-                Console.WriteLine("\nDisplaying unprioritized issues:");
+                Console.WriteLine($"\nDisplaying issues for Level {sortedLevels.Count}");
                 DisplayDiagnostics(unprioritizedDiagnostics);
                 issueFound = true;
             }
