@@ -517,7 +517,6 @@ public class Program
 
             if (levelDiagnostics.Any())
             {
-                Console.WriteLine($"\nDisplaying issues for Level {level.Level}: {level.Name}");
                 DisplayDiagnostics(levelDiagnostics);
                 issueFound = true;
                 break; 
