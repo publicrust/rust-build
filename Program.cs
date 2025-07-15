@@ -337,16 +337,26 @@ public class Program
             // Error handling during loading
             workspace.WorkspaceFailed += (sender, e) => Console.WriteLine($"Workspace error: {e.Diagnostic.Message}");
 
+            Console.WriteLine("\n" + new string('=', 60));
+            Console.WriteLine("🔍 STATIC ANALYSIS");
+            Console.WriteLine(new string('=', 60));
+
             try
             {
                 var isSolution = path != null && path.EndsWith(".sln", StringComparison.OrdinalIgnoreCase);
                 if (isSolution)
                 {
-                    await AnalyzeSolution(workspace, path, pluginName);
+                    if (path != null)
+                    {
+                        await AnalyzeSolution(workspace, path, pluginName);
+                    }
                 }
                 else
                 {
-                    await AnalyzeProject(workspace, path, pluginName);
+                    if (path != null)
+                    {
+                        await AnalyzeProject(workspace, path, pluginName);
+                    }
                 }
             }
             catch (Exception ex)
@@ -376,6 +386,12 @@ public class Program
 
     private static async Task AnalyzeSolution(MSBuildWorkspace workspace, string solutionPath, string? pluginName = null)
     {
+        if (string.IsNullOrEmpty(solutionPath))
+        {
+            Console.WriteLine("Error: Solution path is null or empty");
+            return;
+        }
+
         var solution = await workspace.OpenSolutionAsync(solutionPath);
         Console.WriteLine($"Solution loaded successfully. Projects: {solution.Projects.Count()}");
         Console.WriteLine("----------------------------------------------------");
@@ -406,6 +422,12 @@ public class Program
 
     private static async Task AnalyzeProject(MSBuildWorkspace workspace, string projectPath, string? pluginName = null)
     {
+        if (string.IsNullOrEmpty(projectPath))
+        {
+            Console.WriteLine("Error: Project path is null or empty");
+            return;
+        }
+
         var project = await workspace.OpenProjectAsync(projectPath);
         Console.WriteLine($"Project loaded successfully: {project.Name}");
         Console.WriteLine("----------------------------------------------------");
@@ -614,18 +636,17 @@ public class Program
 
     private static void PrintFinalReport(bool issuesFound)
     {
-        Console.WriteLine("\n----------------------------------------------------");
         if (issuesFound)
         {
              Console.ForegroundColor = ConsoleColor.Red;
-             Console.WriteLine("Analysis finished. Errors or warnings found.");
+             Console.WriteLine("❌ Critical issues found - any error blocks plugin compilation and deployment.");
              Console.ResetColor();
              _hasErrors = true;
         }
         else
         {
              Console.ForegroundColor = ConsoleColor.Green;
-             Console.WriteLine("Analysis finished. No errors or warnings found.");
+             Console.WriteLine("✅ No issues found.");
              Console.ResetColor();
         }
     }
@@ -726,8 +747,9 @@ public class Program
     // Мердж всех плагинов из plugins в build
     static void MergeAllPlugins(string pluginsDir, string buildDir, string? specificPluginName = null)
     {
-        // Убираем дублирующий вызов RunDotnetFormat - форматирование уже произошло в начале Main
-        // RunDotnetFormat(pluginsDir, specificPluginName);
+        Console.WriteLine("\n" + new string('=', 60));
+        Console.WriteLine("🔗 PLUGIN MERGING");
+        Console.WriteLine(new string('=', 60));
         
         var pluginDirs = Directory.GetDirectories(pluginsDir, "*", SearchOption.AllDirectories)
             .Where(d => Directory.GetFiles(d, "*.cs").Any()).ToList();
@@ -741,32 +763,52 @@ public class Program
             
             if (pluginDirs.Count == 0)
             {
-                Console.WriteLine($"Error: Plugin '{specificPluginName}' not found in {pluginsDir}");
+                Console.WriteLine($"❌ Error: Plugin '{specificPluginName}' not found in {pluginsDir}");
                 return;
             }
         }
+
+        int mergedCount = 0;
+        int skippedCount = 0;
+        var skippedPlugins = new List<string>();
         
         foreach (var pluginDir in pluginDirs)
         {
             var relativePath = Path.GetRelativePath(pluginsDir, pluginDir);
             var pluginName = relativePath.Replace(Path.DirectorySeparatorChar, '_');
-            // Если указан конкретный плагин и это не тот плагин, пропускаем
-            if (!string.IsNullOrEmpty(specificPluginName) && 
-                !pluginName.Equals(specificPluginName, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
+            
             if (_pluginErrorCount.TryGetValue(pluginName, out var errCount) && errCount > 0)
             {
-                Console.WriteLine($"[merge-plugin] SKIP {pluginName}: {errCount} error(s)");
+                Console.WriteLine($"⏭️  SKIP {pluginName}: {errCount} error(s)");
+                skippedCount++;
+                skippedPlugins.Add($"{pluginName} ({errCount} errors)");
                 continue;
             }
+            
             var outputFile = Path.Combine(buildDir, $"{pluginName}.cs");
             MergePluginPartials(pluginDir, outputFile);
+            mergedCount++;
         }
         
-        if (pluginDirs.Any())
-            Console.WriteLine($"[merge-plugin] All plugins merged to {buildDir}");
+        Console.WriteLine("\n📋 MERGE SUMMARY");
+        Console.WriteLine(new string('-', 30));
+        Console.WriteLine($"Plugins processed: {pluginDirs.Count}");
+        Console.WriteLine($"Successfully merged: {mergedCount}");
+        Console.WriteLine($"Skipped due to errors: {skippedCount}");
+        
+        if (skippedPlugins.Any())
+        {
+            Console.WriteLine($"\n⚠️  Skipped plugins:");
+            foreach (var plugin in skippedPlugins)
+            {
+                Console.WriteLine($"   • {plugin}");
+            }
+        }
+        
+        if (mergedCount > 0)
+        {
+            Console.WriteLine($"\n✅ Output directory: {buildDir}");
+        }
     }
 
     // Запуск dotnet format для плагинов
@@ -795,39 +837,15 @@ public class Program
                 Console.WriteLine($"[format] Warning: Multiple .csproj files found. Using: {Path.GetFileName(csprojFile)}");
             }
 
-            Console.WriteLine("[format] Running dotnet format...");
+            Console.WriteLine("\n" + new string('=', 60));
+            Console.WriteLine("🔧 CODE FORMATTING");
+            Console.WriteLine(new string('=', 60));
 
             if (string.IsNullOrEmpty(specificPluginName))
             {
                 // Форматируем все плагины
-                Console.WriteLine("[format] Formatting all plugins...");
-                var command = $"format \"{Path.GetFileName(csprojFile)}\" --exclude-diagnostics -IDE0005";
-                Console.WriteLine($"[format] Command: cd {parentDir} && dotnet {command}");
-                
-                var startInfo = new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = "dotnet",
-                    Arguments = command,
-                    WorkingDirectory = parentDir,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-
-                using var process = System.Diagnostics.Process.Start(startInfo);
-                if (process != null)
-                {
-                    process.WaitForExit();
-                    if (process.ExitCode == 0)
-                    {
-                        Console.WriteLine("[format] Successfully formatted all plugins");
-                    }
-                    else
-                    {
-                        Console.WriteLine($"[format] Warning: dotnet format exited with code {process.ExitCode}");
-                    }
-                }
+                Console.WriteLine("[format] Target: All plugins");
+                FormatWithLoop(parentDir, csprojFile, null);
             }
             else
             {
@@ -846,44 +864,218 @@ public class Program
                     return;
                 }
 
-                Console.WriteLine($"[format] Formatting plugin '{specificPluginName}' ({csFiles.Length} files)...");
-                
-                foreach (var csFile in csFiles)
-                {
-                    var relativePath = Path.GetRelativePath(parentDir, csFile);
-                    var command = $"format \"{Path.GetFileName(csprojFile)}\" --include \"{relativePath}\" --exclude-diagnostics -IDE0005";
-                    Console.WriteLine($"[format] Command: cd {parentDir} && dotnet {command}");
-                    
-                    var startInfo = new System.Diagnostics.ProcessStartInfo
-                    {
-                        FileName = "dotnet",
-                        Arguments = command,
-                        WorkingDirectory = parentDir,
-                        UseShellExecute = false,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true,
-                        CreateNoWindow = true
-                    };
-
-                    using var process = System.Diagnostics.Process.Start(startInfo);
-                    if (process != null)
-                    {
-                        process.WaitForExit();
-                        if (process.ExitCode == 0)
-                        {
-                            Console.WriteLine($"[format] Formatted: {Path.GetFileName(csFile)}");
-                        }
-                        else
-                        {
-                            Console.WriteLine($"[format] Warning: Failed to format {Path.GetFileName(csFile)} (exit code: {process.ExitCode})");
-                        }
-                    }
-                }
+                Console.WriteLine($"[format] Target: Plugin '{specificPluginName}' ({csFiles.Length} files)");
+                FormatWithLoop(parentDir, csprojFile, csFiles);
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[format] Error running dotnet format: {ex.Message}");
         }
+    }
+
+    private static void FormatWithLoop(string parentDir, string csprojFile, string[]? csFiles)
+    {
+        const int maxAttempts = 3;
+        int attempts = 0;
+        bool needsFormatting = true;
+        var unFixableIssues = new HashSet<string>();
+        var totalIssuesFound = 0;
+        var issuesFixed = 0;
+        var previousUnFixableIssues = new HashSet<string>();
+
+        while (needsFormatting && attempts < maxAttempts)
+        {
+            attempts++;
+            Console.WriteLine($"\n┌─ Attempt {attempts}/{maxAttempts} " + new string('─', 40));
+
+            // Step 1: Verify if changes are needed
+            string verifyCommand = $"format \"{Path.GetFileName(csprojFile)}\" --verify-no-changes --exclude-diagnostics IDE0005 --verbosity diagnostic";
+            if (csFiles != null)
+            {
+                verifyCommand += " --include " + string.Join(" ", csFiles.Select(f => $"\"{Path.GetRelativePath(parentDir, f)}\""));
+            }
+            var (verifyExitCode, verifyOutput, verifyError) = RunDotnetCommand(parentDir, verifyCommand);
+
+            // Count issues found in this attempt
+            var currentIssuesCount = CountIssuesInOutput(verifyError);
+            if (attempts == 1)
+            {
+                totalIssuesFound = currentIssuesCount;
+                Console.WriteLine($"│ 🔍 Issues detected: {totalIssuesFound}");
+            }
+
+            if (verifyExitCode == 0)
+            {
+                Console.WriteLine("│ ✅ No more formatting needed");
+                needsFormatting = false;
+                break;
+            }
+
+            Console.WriteLine($"│ 📊 Remaining issues: {currentIssuesCount}");
+
+            // Step 2: Perform formatting
+            string formatCommand = $"format \"{Path.GetFileName(csprojFile)}\" --exclude-diagnostics IDE0005 --verbosity diagnostic";
+            if (csFiles != null)
+            {
+                formatCommand += " --include " + string.Join(" ", csFiles.Select(f => $"\"{Path.GetRelativePath(parentDir, f)}\""));
+            }
+            var (formatExitCode, formatOutput, formatError) = RunDotnetCommand(parentDir, formatCommand);
+
+            // Extract changed files from output
+            var changedFiles = ExtractChangedFiles(formatOutput);
+            if (changedFiles.Any())
+            {
+                Console.WriteLine($"│ 📝 Modified files: {string.Join(", ", changedFiles.Select(Path.GetFileName))}");
+            }
+            else
+            {
+                Console.WriteLine("│ 📝 No files were modified");
+            }
+
+            // Filter out RustAnalyzer noise and extract unfixable issues
+            var filteredFormatError = FilterRustAnalyzerOutput(formatError);
+            if (!string.IsNullOrEmpty(filteredFormatError)) 
+            {
+                var unFixableInThisAttempt = ExtractUnFixableIssues(filteredFormatError);
+                foreach (var issue in unFixableInThisAttempt)
+                {
+                    unFixableIssues.Add(issue);
+                }
+                
+                if (unFixableInThisAttempt.Any())
+                {
+                    Console.WriteLine($"│ ❌ Auto-fix failed: {string.Join(", ", unFixableInThisAttempt)}");
+                    
+                    // Check if unfixable issues are the same as previous attempt
+                    if (attempts > 1 && new HashSet<string>(unFixableInThisAttempt).SetEquals(previousUnFixableIssues))
+                    {
+                        Console.WriteLine("│ ⚠️  Same issues persist - stopping early");
+                        needsFormatting = false;
+                        break;
+                    }
+                    
+                    previousUnFixableIssues = new HashSet<string>(unFixableInThisAttempt);
+                }
+            }
+
+            Console.WriteLine("└" + new string('─', 50));
+        }
+
+        // Calculate statistics
+        issuesFixed = Math.Max(0, totalIssuesFound - unFixableIssues.Count);
+
+        // Final summary
+        Console.WriteLine("\n📋 FORMATTING SUMMARY");
+        Console.WriteLine(new string('-', 30));
+        Console.WriteLine($"Total attempts: {attempts}");
+        Console.WriteLine($"Issues found: {totalIssuesFound}");
+        Console.WriteLine($"Issues fixed: {issuesFixed}");
+        Console.WriteLine($"Manual fixes needed: {unFixableIssues.Count}");
+
+        if (needsFormatting && unFixableIssues.Any())
+        {
+            Console.WriteLine($"\n🔧 Requires manual attention:");
+            foreach (var issue in unFixableIssues.OrderBy(x => x))
+            {
+                Console.WriteLine($"   • {issue}");
+            }
+        }
+        else if (!needsFormatting)
+        {
+            Console.WriteLine("\n✅ All formatting issues resolved!");
+        }
+    }
+
+    private static int CountIssuesInOutput(string output)
+    {
+        if (string.IsNullOrEmpty(output)) return 0;
+        
+        // Count lines that contain error/warning patterns
+        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        return lines.Count(line => 
+            line.Contains(": error ") || 
+            line.Contains(": warning ") ||
+            line.Contains(": info "));
+    }
+
+    private static List<string> ExtractChangedFiles(string output)
+    {
+        var changedFiles = new List<string>();
+        if (string.IsNullOrEmpty(output)) return changedFiles;
+
+        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var line in lines)
+        {
+            // Look for patterns like "Formatted code file '/path/to/file.cs'"
+            if (line.Contains("Formatted") && line.Contains(".cs"))
+            {
+                var match = System.Text.RegularExpressions.Regex.Match(line, @"'([^']+\.cs)'");
+                if (match.Success)
+                {
+                    changedFiles.Add(match.Groups[1].Value);
+                }
+            }
+        }
+
+        return changedFiles.Distinct().ToList();
+    }
+
+    private static string FilterRustAnalyzerOutput(string output)
+    {
+        if (string.IsNullOrEmpty(output)) return output;
+        
+        var lines = output.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        var filteredLines = lines.Where(line => 
+            !line.Contains("[RustAnalyzer]") && 
+            !line.Trim().StartsWith("RustAnalyzer") &&
+            !string.IsNullOrWhiteSpace(line)
+        ).ToArray();
+        
+        return string.Join("\n", filteredLines);
+    }
+
+    private static List<string> ExtractUnFixableIssues(string errorOutput)
+    {
+        var issues = new List<string>();
+        var lines = errorOutput.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        
+        foreach (var line in lines)
+        {
+            if (line.Contains("Unable to fix"))
+            {
+                // Extract the diagnostic ID from "Unable to fix CA1859" or similar
+                var match = System.Text.RegularExpressions.Regex.Match(line, @"Unable to fix ([A-Z0-9]+)");
+                if (match.Success)
+                {
+                    issues.Add(match.Groups[1].Value);
+                }
+            }
+        }
+        
+        return issues;
+    }
+
+    private static (int ExitCode, string Output, string Error) RunDotnetCommand(string workingDir, string arguments)
+    {
+        var startInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = arguments,
+            WorkingDirectory = workingDir,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+
+        using var process = new System.Diagnostics.Process { StartInfo = startInfo };
+        process.Start();
+
+        string output = process.StandardOutput.ReadToEnd().Trim();
+        string error = process.StandardError.ReadToEnd().Trim();
+
+        process.WaitForExit();
+        return (process.ExitCode, output, error);
     }
 }
