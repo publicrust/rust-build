@@ -801,7 +801,7 @@ public class Program
             {
                 // Форматируем все плагины
                 Console.WriteLine("[format] Formatting all plugins...");
-                var command = $"format \"{Path.GetFileName(csprojFile)}\" --diagnostics -IDE0005";
+                var command = $"format \"{Path.GetFileName(csprojFile)}\" --exclude-diagnostics -IDE0005";
                 Console.WriteLine($"[format] Command: cd {parentDir} && dotnet {command}");
                 
                 var startInfo = new System.Diagnostics.ProcessStartInfo
@@ -851,7 +851,7 @@ public class Program
                 foreach (var csFile in csFiles)
                 {
                     var relativePath = Path.GetRelativePath(parentDir, csFile);
-                    var command = $"format \"{Path.GetFileName(csprojFile)}\" --include \"{relativePath}\" --diagnostics -IDE0005";
+                    var command = $"format \"{Path.GetFileName(csprojFile)}\" --include \"{relativePath}\" --exclude-diagnostics -IDE0005";
                     Console.WriteLine($"[format] Command: cd {parentDir} && dotnet {command}");
                     
                     var startInfo = new System.Diagnostics.ProcessStartInfo
