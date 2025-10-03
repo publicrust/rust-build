@@ -10,6 +10,7 @@ using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.MSBuild;
+using Microsoft.CodeAnalysis.Text;
 using System.Collections.Immutable;
 using System.Collections.Generic;
 using Newtonsoft.Json;
@@ -701,7 +702,7 @@ public class Program
     static void MergePluginPartials(string srcDir, string output)
     {
         var trees = Directory.GetFiles(srcDir, "*.cs", SearchOption.AllDirectories)
-            .Select(f => Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(File.ReadAllText(f))).ToList();
+            .Select(f => Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(File.ReadAllText(f), path: f)).ToList();
 
         // Проверяем, что все классы имеют модификатор partial
         var allClasses = trees.SelectMany(t => t.GetRoot()
@@ -709,22 +710,51 @@ public class Program
                 .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax>())
             .ToList();
 
-        // Находим только основные классы плагинов (наследуемые от RustPlugin или CovalencePlugin)
-        var pluginClasses = allClasses
-            .Where(c => c.BaseList != null && c.BaseList.Types.Any(t => 
-                t.ToString().Contains("RustPlugin") || t.ToString().Contains("CovalencePlugin")))
+        // Находим основной класс плагина по базовому типу или атрибутам
+        var pluginBaseMarkers = new[] { "RustPlugin", "CovalencePlugin" };
+        var primaryPluginClasses = allClasses
+            .Where(c => c.BaseList != null && c.BaseList.Types.Any(t =>
+            {
+                var typeName = t.Type?.ToString() ?? t.ToString();
+                return pluginBaseMarkers.Any(marker => typeName.Contains(marker, StringComparison.Ordinal));
+            }))
             .ToList();
-        
-        // Если не нашли ни одного класса плагина, берем все public классы
-        if (!pluginClasses.Any())
+
+        if (!primaryPluginClasses.Any())
         {
-            pluginClasses = allClasses
-                .Where(c => c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PublicKeyword)))
+            primaryPluginClasses = allClasses
+                .Where(c => c.AttributeLists
+                    .SelectMany(a => a.Attributes)
+                    .Any(attr => attr.Name.ToString().Contains("Info", StringComparison.Ordinal)))
                 .ToList();
         }
-        
-        // Проверяем, что основные классы плагинов имеют модификатор partial
-        var nonPartialClasses = pluginClasses
+
+        if (!primaryPluginClasses.Any())
+        {
+            primaryPluginClasses = allClasses
+                .Where(c => c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PublicKeyword))
+                            && c.Identifier.Text.EndsWith("Plugin", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+
+        var pluginClassNames = new HashSet<string>(primaryPluginClasses.Select(c => c.Identifier.Text));
+        var classesToCheck = allClasses
+            .Where(c => pluginClassNames.Contains(c.Identifier.Text))
+            .ToList();
+
+        if (!classesToCheck.Any())
+        {
+            classesToCheck = primaryPluginClasses;
+        }
+
+        var pluginNameKey = Path.GetFileName(srcDir);
+        if (!string.IsNullOrEmpty(_pluginsRoot) && srcDir.StartsWith(_pluginsRoot, StringComparison.Ordinal))
+        {
+            pluginNameKey = Path.GetRelativePath(_pluginsRoot, srcDir)
+                .Replace(Path.DirectorySeparatorChar, '_');
+        }
+
+        var nonPartialClasses = classesToCheck
             .Where(c => !c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword)))
             .ToList();
 
@@ -738,21 +768,105 @@ public class Program
                 var fileName = string.IsNullOrEmpty(filePath) ? "<unknown file>" : Path.GetFileName(filePath);
                 Console.WriteLine($"  - Plugin class '{cls.Identifier}' in {fileName} is missing 'partial' modifier");
             }
-            Console.WriteLine("  All plugin classes must have 'partial' modifier to be merged properly.");
+            Console.WriteLine("  All plugin class parts must use the 'partial' modifier.");
             Console.ResetColor();
-            
-            // Добавляем ошибку для этого плагина
-            var pluginName = Path.GetFileName(srcDir);
-            if (!_pluginErrorCount.ContainsKey(pluginName)) _pluginErrorCount[pluginName] = 0;
-            _pluginErrorCount[pluginName] += nonPartialClasses.Count;
-            
+
+            if (!_pluginErrorCount.ContainsKey(pluginNameKey))
+                _pluginErrorCount[pluginNameKey] = 0;
+            _pluginErrorCount[pluginNameKey] += nonPartialClasses.Count;
+
             return;
         }
-        
-        // ➊ собрать уникальные using-директивы
-        var usings = trees.SelectMany(t => ((Microsoft.CodeAnalysis.CSharp.Syntax.CompilationUnitSyntax)t.GetRoot()).Usings)
+
+        // Убедимся, что каждый файл содержит только partial-части основного класса
+        var pluginNamespaces = new HashSet<string?>(primaryPluginClasses.Select(c => NamespaceOf(c)));
+        var violatingFiles = new List<PluginFileViolation>();
+
+        foreach (var tree in trees)
+        {
+            var root = tree.GetRoot();
+            var topLevelTypes = root.DescendantNodes()
+                .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax>()
+                .Where(IsTopLevelType)
+                .ToList();
+
+            if (!topLevelTypes.Any())
+                continue;
+
+            var pluginPartialsInFile = topLevelTypes
+                .Where(t => pluginClassNames.Contains(t.Identifier.Text)
+                    && t.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword))
+                    && pluginNamespaces.Contains(NamespaceOf(t)))
+                .ToList();
+
+            var extraTypes = topLevelTypes
+                .Where(t => !(pluginClassNames.Contains(t.Identifier.Text)
+                    && t.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword))
+                    && pluginNamespaces.Contains(NamespaceOf(t))))
+                .ToList();
+
+            if (!pluginPartialsInFile.Any() || extraTypes.Any())
+            {
+                var extraInfos = extraTypes.Select(t => new ExtraTypeInfo(
+                    t.Keyword.ValueText,
+                    BuildQualifiedName(NamespaceOf(t), t.Identifier.Text),
+                    TryGetLineSpan(t.Identifier.GetLocation()))).ToList();
+
+                var primarySpan = extraInfos.FirstOrDefault(e => e.Span.HasValue)?.Span
+                    ?? TryGetLineSpan(pluginPartialsInFile.FirstOrDefault()?.Identifier.GetLocation())
+                    ?? TryCreateFallbackSpan(tree.FilePath);
+
+                violatingFiles.Add(new PluginFileViolation(
+                    tree.FilePath ?? "<unknown>",
+                    !pluginPartialsInFile.Any(),
+                    extraInfos,
+                    primarySpan));
+            }
+        }
+
+        if (violatingFiles.Any())
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"[merge-plugin] ERROR: Each file in plugin '{Path.GetFileName(srcDir)}' must consist only of partial declarations for '{pluginClassNames.FirstOrDefault()}'");
+            Console.ResetColor();
+
+            foreach (var violation in violatingFiles)
+            {
+                var filePath = violation.FilePath;
+                var span = violation.PrimarySpan;
+                var line = span?.StartLinePosition.Line ?? 0;
+                var column = span?.StartLinePosition.Character ?? 0;
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"❌ {filePath}({line + 1},{column + 1}): error RBP001: File must only contain partial '{pluginClassNames.FirstOrDefault()}' declarations.");
+                Console.ResetColor();
+
+                if (violation.MissingPartial)
+                {
+                    Console.WriteLine("    • Missing partial plugin class definition");
+                }
+
+                foreach (var extraType in violation.ExtraTypes)
+                {
+                    Console.WriteLine($"    • Extra top-level {extraType.Kind} '{extraType.QualifiedName}'");
+                }
+
+                PrintSourceSnippet(filePath, span);
+            }
+
+            if (!_pluginErrorCount.ContainsKey(pluginNameKey))
+                _pluginErrorCount[pluginNameKey] = 0;
+            _pluginErrorCount[pluginNameKey] += violatingFiles.Count;
+
+            return;
+        }
+
+        // ➊ собрать уникальные using-директивы как синтаксические узлы
+        var usingNodes = trees
+            .SelectMany(t => ((Microsoft.CodeAnalysis.CSharp.Syntax.CompilationUnitSyntax)t.GetRoot()).Usings)
+            .Where(u => u != null)
             .Distinct(new UsingComparer())
-            .Select(u => u.ToFullString());
+            .ToList();
+
         // ➋ найти все partial-класс(ы) верхнего уровня
         var partials = trees.SelectMany(t => t.GetRoot()
                 .DescendantNodes()
@@ -760,21 +874,191 @@ public class Program
                 .Where(c => c.Modifiers.Any(m => m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword))))
             .GroupBy(c => (c.Identifier.Text, NamespaceOf(c)))
             .ToList();
-        // ➌ объединить тела
-        var result = string.Join(Environment.NewLine, usings) + "\n\n";
-        foreach (var group in partials)
+
+        var namespaceGroups = partials.GroupBy(p => p.Key.Item2 ?? string.Empty);
+        var members = new List<Microsoft.CodeAnalysis.CSharp.Syntax.MemberDeclarationSyntax>();
+
+        foreach (var nsGroup in namespaceGroups)
         {
-            var (className, ns) = group.Key;
-            result += $"namespace {ns}\n{{\n    public class {className}\n    {{\n";
-            foreach (var part in group)
-                result += string.Join("", part.Members.Select(m => m.ToFullString())) + "\n";
-            result += "    }\n}\n";
+            var classDeclarations = nsGroup
+                .Select(BuildMergedClassSyntax)
+                .Cast<Microsoft.CodeAnalysis.CSharp.Syntax.MemberDeclarationSyntax>()
+                .ToList();
+
+            if (!string.IsNullOrEmpty(nsGroup.Key))
+            {
+                var namespaceDecl = Microsoft.CodeAnalysis.CSharp.SyntaxFactory.NamespaceDeclaration(
+                        Microsoft.CodeAnalysis.CSharp.SyntaxFactory.ParseName(nsGroup.Key))
+                    .WithMembers(Microsoft.CodeAnalysis.CSharp.SyntaxFactory.List(classDeclarations));
+                members.Add(namespaceDecl);
+            }
+            else
+            {
+                members.AddRange(classDeclarations);
+            }
         }
-        File.WriteAllText(output, result);
+
+        var compilation = Microsoft.CodeAnalysis.CSharp.SyntaxFactory.CompilationUnit()
+            .WithUsings(Microsoft.CodeAnalysis.CSharp.SyntaxFactory.List(usingNodes))
+            .WithMembers(Microsoft.CodeAnalysis.CSharp.SyntaxFactory.List(members))
+            .NormalizeWhitespace("    ", Environment.NewLine, false);
+
+        File.WriteAllText(output, compilation.ToFullString());
         Console.WriteLine($"[merge-plugin] {srcDir} → {output}");
     }
-    static string? NamespaceOf(Microsoft.CodeAnalysis.SyntaxNode node) =>
-        node.Ancestors().OfType<Microsoft.CodeAnalysis.CSharp.Syntax.NamespaceDeclarationSyntax>().FirstOrDefault()?.Name.ToString();
+    static string? NamespaceOf(Microsoft.CodeAnalysis.SyntaxNode node)
+    {
+        var namespaceNode = node.Ancestors()
+            .OfType<Microsoft.CodeAnalysis.CSharp.Syntax.BaseNamespaceDeclarationSyntax>()
+            .FirstOrDefault();
+        return namespaceNode?.Name.ToString();
+    }
+
+    static bool IsTopLevelType(Microsoft.CodeAnalysis.CSharp.Syntax.TypeDeclarationSyntax typeSyntax) =>
+        typeSyntax.Parent is Microsoft.CodeAnalysis.CSharp.Syntax.CompilationUnitSyntax
+        || typeSyntax.Parent is Microsoft.CodeAnalysis.CSharp.Syntax.NamespaceDeclarationSyntax
+        || typeSyntax.Parent is Microsoft.CodeAnalysis.CSharp.Syntax.FileScopedNamespaceDeclarationSyntax;
+
+    static string BuildQualifiedName(string? ns, string identifier) =>
+        string.IsNullOrEmpty(ns) ? identifier : $"{ns}.{identifier}";
+
+    static FileLinePositionSpan? TryGetLineSpan(Location? location)
+    {
+        if (location == null || !location.IsInSource)
+            return null;
+        return location.GetLineSpan();
+    }
+
+    static FileLinePositionSpan? TryCreateFallbackSpan(string? filePath)
+    {
+        if (string.IsNullOrEmpty(filePath))
+            return null;
+        return new FileLinePositionSpan(filePath, new LinePosition(0, 0), new LinePosition(0, 0));
+    }
+
+    static void PrintSourceSnippet(string? filePath, FileLinePositionSpan? span)
+    {
+        if (string.IsNullOrEmpty(filePath) || !File.Exists(filePath) || !span.HasValue)
+            return;
+
+        string[] lines;
+        try
+        {
+            lines = File.ReadAllLines(filePath);
+        }
+        catch
+        {
+            return;
+        }
+
+        var startLine = Math.Max(0, span.Value.StartLinePosition.Line - 2);
+        var endLine = Math.Min(lines.Length - 1, span.Value.StartLinePosition.Line + 2);
+        for (int i = startLine; i <= endLine; i++)
+        {
+            var prefix = i == span.Value.StartLinePosition.Line ? ">" : " ";
+            Console.WriteLine($"  {prefix} {(i + 1).ToString().PadLeft(4)} | {lines[i]}");
+
+            if (i == span.Value.StartLinePosition.Line)
+            {
+                var highlightColumn = Math.Max(0, span.Value.StartLinePosition.Character);
+                var caretLength = Math.Max(1, span.Value.EndLinePosition.Character - span.Value.StartLinePosition.Character);
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                Console.WriteLine($"       | {new string(' ', highlightColumn)}{new string('^', caretLength)}");
+                Console.ResetColor();
+            }
+        }
+    }
+
+    class PluginFileViolation
+    {
+        public PluginFileViolation(string filePath, bool missingPartial, List<ExtraTypeInfo> extraTypes, FileLinePositionSpan? primarySpan)
+        {
+            FilePath = filePath;
+            MissingPartial = missingPartial;
+            ExtraTypes = extraTypes;
+            PrimarySpan = primarySpan;
+        }
+
+        public string FilePath { get; }
+        public bool MissingPartial { get; }
+        public List<ExtraTypeInfo> ExtraTypes { get; }
+        public FileLinePositionSpan? PrimarySpan { get; }
+    }
+
+    class ExtraTypeInfo
+    {
+        public ExtraTypeInfo(string kind, string qualifiedName, FileLinePositionSpan? span)
+        {
+            Kind = kind;
+            QualifiedName = qualifiedName;
+            Span = span;
+        }
+
+        public string Kind { get; }
+        public string QualifiedName { get; }
+        public FileLinePositionSpan? Span { get; }
+    }
+
+    static Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax BuildMergedClassSyntax(
+        IGrouping<(string className, string? ns), Microsoft.CodeAnalysis.CSharp.Syntax.ClassDeclarationSyntax> group)
+    {
+        var parts = group.ToList();
+        var basePart = parts.FirstOrDefault(p => p.BaseList != null) ?? parts.First();
+
+        // Собираем атрибуты без дубликатов, сохраняя порядок по исходному расположению
+        var attributeLists = new List<Microsoft.CodeAnalysis.CSharp.Syntax.AttributeListSyntax>();
+        var seenAttributes = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var attribute in parts.SelectMany(p => p.AttributeLists).OrderBy(a => a.SpanStart))
+        {
+            var key = attribute.ToFullString();
+            if (seenAttributes.Add(key))
+            {
+                attributeLists.Add(attribute);
+            }
+        }
+
+        // Объединяем модификаторы, удаляя partial
+        var filteredModifiers = basePart.Modifiers
+            .Where(m => !m.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PartialKeyword));
+        var modifierTokens = Microsoft.CodeAnalysis.CSharp.SyntaxFactory.TokenList(filteredModifiers);
+        if (modifierTokens.Count == 0)
+        {
+            modifierTokens = Microsoft.CodeAnalysis.CSharp.SyntaxFactory.TokenList(
+                Microsoft.CodeAnalysis.CSharp.SyntaxFactory.Token(Microsoft.CodeAnalysis.CSharp.SyntaxKind.PublicKeyword));
+        }
+
+        // Сохраняем порядок членов по их положению в исходных файлах
+        var orderedMembers = parts
+            .SelectMany(p => p.Members)
+            .Select(m => new { Member = m, Start = m.GetLocation()?.SourceSpan.Start ?? int.MaxValue })
+            .OrderBy(x => x.Start)
+            .Select(x => x.Member)
+            .ToList();
+
+        var memberList = Microsoft.CodeAnalysis.CSharp.SyntaxFactory.List(orderedMembers);
+
+        var merged = Microsoft.CodeAnalysis.CSharp.SyntaxFactory.ClassDeclaration(basePart.Identifier)
+            .WithAttributeLists(Microsoft.CodeAnalysis.CSharp.SyntaxFactory.List(attributeLists))
+            .WithModifiers(modifierTokens)
+            .WithMembers(memberList);
+
+        if (basePart.TypeParameterList != null)
+        {
+            merged = merged.WithTypeParameterList(basePart.TypeParameterList);
+        }
+
+        if (basePart.BaseList != null)
+        {
+            merged = merged.WithBaseList(basePart.BaseList);
+        }
+
+        if (basePart.ConstraintClauses.Count > 0)
+        {
+            merged = merged.WithConstraintClauses(basePart.ConstraintClauses);
+        }
+
+        return merged;
+    }
     class UsingComparer : IEqualityComparer<Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax>
     {
         public bool Equals(Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax? x, Microsoft.CodeAnalysis.CSharp.Syntax.UsingDirectiveSyntax? y)
@@ -832,7 +1116,17 @@ public class Program
             }
             
             var outputFile = Path.Combine(buildDir, $"{pluginName}.cs");
+            var previousErrors = _pluginErrorCount.TryGetValue(pluginName, out var beforeCount) ? beforeCount : 0;
             MergePluginPartials(pluginDir, outputFile);
+            var currentErrors = _pluginErrorCount.TryGetValue(pluginName, out var afterCount) ? afterCount : 0;
+
+            if (currentErrors > previousErrors)
+            {
+                skippedCount++;
+                skippedPlugins.Add($"{pluginName} ({currentErrors - previousErrors} new error(s))");
+                continue;
+            }
+
             mergedCount++;
         }
         
@@ -1323,10 +1617,15 @@ public class Program
         using var process = new System.Diagnostics.Process { StartInfo = startInfo };
         process.Start();
 
-        string output = process.StandardOutput.ReadToEnd().Trim();
-        string error = process.StandardError.ReadToEnd().Trim();
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
 
         process.WaitForExit();
+        Task.WaitAll(outputTask, errorTask);
+
+        string output = outputTask.Result.Trim();
+        string error = errorTask.Result.Trim();
+
         return (process.ExitCode, output, error);
     }
 
@@ -1555,4 +1854,3 @@ public class Program
         return baseCommand;
     }
 }
-
