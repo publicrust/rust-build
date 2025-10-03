@@ -14,10 +14,26 @@ using System.Collections.Immutable;
 using System.Collections.Generic;
 using Newtonsoft.Json;
 using System.Text;
+using System.Collections.Concurrent;
+using System.Threading;
 
 public class LinterConfig
 {
     public List<PriorityLevel> PriorityLevels { get; set; } = new List<PriorityLevel>();
+    public ProblematicPluginThresholds ProblematicPluginThresholds { get; set; } = new ProblematicPluginThresholds();
+}
+
+public class ProblematicPluginThresholds
+{
+    public int MaxFiles { get; set; } = 50;
+    public long MaxTotalSizeMB { get; set; } = 5;
+    public int MaxTotalLines { get; set; } = 50000;
+    public int MaxLargeFiles { get; set; } = 10;
+    public int MaxVeryLargeFiles { get; set; } = 0;
+    public int MaxErrorProneFiles { get; set; } = 5;
+    public int LargeFileSizeKB { get; set; } = 100;
+    public int VeryLargeFileSizeKB { get; set; } = 500;
+    public int ErrorProneFileLines { get; set; } = 1000;
 }
 
 public class PriorityLevel
@@ -25,6 +41,36 @@ public class PriorityLevel
     public int Level { get; set; }
     public string Name { get; set; } = string.Empty;
     public List<string> Rules { get; set; } = new List<string>();
+}
+
+public class FormatStats
+{
+    public int Attempts { get; set; }
+    public int TotalIssuesFound { get; set; }
+    public int IssuesFixed { get; set; }
+    public int UnFixableIssues { get; set; }
+}
+
+public class ConcurrentStats
+{
+    private readonly object _lock = new object();
+    private int _totalAttempts;
+    private int _totalIssuesFound;
+    private int _totalIssuesFixed;
+
+    public int TotalAttempts => _totalAttempts;
+    public int TotalIssuesFound => _totalIssuesFound;
+    public int TotalIssuesFixed => _totalIssuesFixed;
+
+    public void Add(FormatStats stats)
+    {
+        lock (_lock)
+        {
+            _totalAttempts += stats.Attempts;
+            _totalIssuesFound += stats.TotalIssuesFound;
+            _totalIssuesFixed += stats.IssuesFixed;
+        }
+    }
 }
 
 public class Program
@@ -811,7 +857,7 @@ public class Program
         }
     }
 
-    // Запуск dotnet format для плагинов
+    // Быстрое форматирование всех плагинов одной командой
     static void RunDotnetFormat(string pluginsDir, string? specificPluginName = null)
     {
         try
@@ -838,18 +884,25 @@ public class Program
             }
 
             Console.WriteLine("\n" + new string('=', 60));
-            Console.WriteLine("🔧 CODE FORMATTING");
+            Console.WriteLine("🔧 CODE FORMATTING (FAST BATCH)");
             Console.WriteLine(new string('=', 60));
 
+            // Определяем количество доступных процессоров
+            var maxCpuCount = Environment.ProcessorCount;
+            Console.WriteLine($"[format] CPU cores detected: {maxCpuCount}");
+
+            // Собираем все файлы для форматирования
+            var allCsFiles = new List<string>();
+            
             if (string.IsNullOrEmpty(specificPluginName))
             {
-                // Форматируем все плагины
-                Console.WriteLine("[format] Target: All plugins");
-                FormatWithLoop(parentDir, csprojFile, null);
+                // Собираем все .cs файлы из всех плагинов
+                allCsFiles = Directory.GetFiles(pluginsDir, "*.cs", SearchOption.AllDirectories).ToList();
+                Console.WriteLine($"[format] Target: All plugins ({allCsFiles.Count} files total)");
             }
             else
             {
-                // Форматируем конкретный плагин
+                // Собираем файлы только из конкретного плагина
                 var pluginDir = Path.Combine(pluginsDir, specificPluginName);
                 if (!Directory.Exists(pluginDir))
                 {
@@ -857,15 +910,28 @@ public class Program
                     return;
                 }
 
-                var csFiles = Directory.GetFiles(pluginDir, "*.cs", SearchOption.AllDirectories);
-                if (csFiles.Length == 0)
-                {
-                    Console.WriteLine($"[format] Warning: No .cs files found in plugin '{specificPluginName}'");
-                    return;
-                }
+                allCsFiles = Directory.GetFiles(pluginDir, "*.cs", SearchOption.AllDirectories).ToList();
+                Console.WriteLine($"[format] Target: Plugin '{specificPluginName}' ({allCsFiles.Count} files)");
+            }
 
-                Console.WriteLine($"[format] Target: Plugin '{specificPluginName}' ({csFiles.Length} files)");
-                FormatWithLoop(parentDir, csprojFile, csFiles);
+            if (allCsFiles.Count == 0)
+            {
+                Console.WriteLine("[format] No .cs files found to format");
+                return;
+            }
+
+            // Детектируем проблемные плагины и применяем соответствующую стратегию
+            var isProblematicPlugin = IsProblematicPlugin(specificPluginName, allCsFiles);
+            
+            if (isProblematicPlugin.isProblematic)
+            {
+                Console.WriteLine($"[format] ⚠️  Detected problematic plugin: {isProblematicPlugin.reason}");
+                FormatProblematicPlugin(parentDir, csprojFile, allCsFiles.ToArray(), maxCpuCount, specificPluginName ?? "Unknown");
+            }
+            else
+            {
+                // Используем быстрое форматирование для обычных плагинов
+                FormatFastBatch(parentDir, csprojFile, allCsFiles.ToArray(), maxCpuCount);
             }
         }
         catch (Exception ex)
@@ -874,117 +940,302 @@ public class Program
         }
     }
 
-    private static void FormatWithLoop(string parentDir, string csprojFile, string[]? csFiles)
+    // Детектирует проблемные плагины, требующие специальной обработки
+    private static (bool isProblematic, string reason) IsProblematicPlugin(string? pluginName, List<string> csFiles)
     {
-        const int maxAttempts = 3;
-        int attempts = 0;
-        bool needsFormatting = true;
-        var unFixableIssues = new HashSet<string>();
-        var totalIssuesFound = 0;
-        var issuesFixed = 0;
-        var previousUnFixableIssues = new HashSet<string>();
-
-        while (needsFormatting && attempts < maxAttempts)
+        // Анализируем характеристики плагина динамически
+        var totalFileSize = 0L;
+        var largeFileCount = 0;
+        var veryLargeFileCount = 0;
+        var totalLines = 0;
+        var errorProneFiles = 0;
+        var thresholds = _config.ProblematicPluginThresholds;
+        
+        foreach (var file in csFiles)
         {
-            attempts++;
-            Console.WriteLine($"\n┌─ Attempt {attempts}/{maxAttempts} " + new string('─', 40));
-
-            // Step 1: Verify if changes are needed
-            string verifyCommand = $"format \"{Path.GetFileName(csprojFile)}\" --verify-no-changes --exclude-diagnostics IDE0005 --verbosity diagnostic";
-            if (csFiles != null)
+            try
             {
-                verifyCommand += " --include " + string.Join(" ", csFiles.Select(f => $"\"{Path.GetRelativePath(parentDir, f)}\""));
+                var fileInfo = new FileInfo(file);
+                totalFileSize += fileInfo.Length;
+                
+                // Подсчитываем строки кода (грубая оценка)
+                var lines = File.ReadAllLines(file).Length;
+                totalLines += lines;
+                
+                // Файлы с потенциальными проблемами (используем настраиваемые пороги)
+                if (fileInfo.Length > thresholds.LargeFileSizeKB * 1024)
+                    largeFileCount++;
+                
+                if (fileInfo.Length > thresholds.VeryLargeFileSizeKB * 1024)
+                    veryLargeFileCount++;
+                
+                // Файлы с большим количеством строк
+                if (lines > thresholds.ErrorProneFileLines)
+                    errorProneFiles++;
+                    
             }
+            catch
+            {
+                // Игнорируем ошибки чтения файлов
+            }
+        }
+        
+        // Динамические критерии на основе настраиваемых порогов
+        
+        // Слишком много файлов
+        if (csFiles.Count > thresholds.MaxFiles)
+        {
+            return (true, $"Too many files: {csFiles.Count} (max: {thresholds.MaxFiles})");
+        }
+        
+        // Слишком большой общий размер
+        if (totalFileSize > thresholds.MaxTotalSizeMB * 1024 * 1024)
+        {
+            return (true, $"Total size too large: {totalFileSize / (1024 * 1024)}MB (max: {thresholds.MaxTotalSizeMB}MB)");
+        }
+        
+        // Слишком много строк кода
+        if (totalLines > thresholds.MaxTotalLines)
+        {
+            return (true, $"Too many lines of code: {totalLines:N0} (max: {thresholds.MaxTotalLines:N0})");
+        }
+        
+        // Много больших файлов
+        if (largeFileCount > thresholds.MaxLargeFiles)
+        {
+            return (true, $"Too many large files: {largeFileCount} (max: {thresholds.MaxLargeFiles})");
+        }
+        
+        // Есть очень большие файлы
+        if (veryLargeFileCount > thresholds.MaxVeryLargeFiles)
+        {
+            return (true, $"Very large files present: {veryLargeFileCount} (max: {thresholds.MaxVeryLargeFiles})");
+        }
+        
+        // Много файлов с большим количеством строк
+        if (errorProneFiles > thresholds.MaxErrorProneFiles)
+        {
+            return (true, $"Too many large files (>{thresholds.ErrorProneFileLines} lines): {errorProneFiles} (max: {thresholds.MaxErrorProneFiles})");
+        }
+        
+        return (false, "Normal plugin");
+    }
+
+    // Быстрое форматирование одним пакетом с продвинутой оптимизацией
+    private static void FormatFastBatch(string parentDir, string csprojFile, string[] csFiles, int maxCpuCount)
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        Console.WriteLine($"[format] 🚀 Enhanced fast batch formatting {csFiles.Length} files...");
+
+        // Стратегия 1: Исключаем проблемные файлы больших размеров
+        var (processFiles, excludedFiles) = FilterProblematicFiles(csFiles);
+        
+        if (excludedFiles.Any())
+        {
+            Console.WriteLine($"[format] ⚠️  Excluded {excludedFiles.Count} large/problematic files:");
+            foreach (var file in excludedFiles.Take(3))
+            {
+                Console.WriteLine($"   • {Path.GetFileName(file)}");
+            }
+            if (excludedFiles.Count > 3)
+                Console.WriteLine($"   ... and {excludedFiles.Count - 3} more");
+        }
+
+        if (processFiles.Length == 0)
+        {
+            Console.WriteLine("[format] ⚠️  No files to process after filtering!");
+            return;
+        }
+
+        // Стратегия 2: Батчинг файлов для избежания слишком длинных командных строк
+        var batches = CreateFileBatches(processFiles, 50); // Максимум 50 файлов за раз
+        
+        Console.WriteLine($"[format] 📦 Processing {batches.Count} batch(es) with {processFiles.Length} files total");
+
+        int totalIssues = 0;
+        int totalFixed = 0;
+        var allChangedFiles = new List<string>();
+        var allUnfixableIssues = new List<string>();
+
+        foreach (var (batch, batchIndex) in batches.Select((b, i) => (b, i + 1)))
+        {
+            Console.WriteLine($"[format] 🔄 Batch {batchIndex}/{batches.Count} ({batch.Length} files)");
+
+            // Verify для текущего батча
+            string verifyCommand = BuildOptimizedFormatCommand(csprojFile, batch, true, maxCpuCount);
             var (verifyExitCode, verifyOutput, verifyError) = RunDotnetCommand(parentDir, verifyCommand);
 
-            // Count issues found in this attempt
-            var currentIssuesCount = CountIssuesInOutput(verifyError);
-            if (attempts == 1)
-            {
-                totalIssuesFound = currentIssuesCount;
-                Console.WriteLine($"│ 🔍 Issues detected: {totalIssuesFound}");
-            }
+            var batchIssues = CountIssuesInOutput(verifyError);
+            totalIssues += batchIssues;
 
             if (verifyExitCode == 0)
             {
-                Console.WriteLine("│ ✅ No more formatting needed");
-                needsFormatting = false;
-                break;
+                Console.WriteLine($"[format] ✅ Batch {batchIndex}: No formatting needed");
+                continue;
             }
 
-            Console.WriteLine($"│ 📊 Remaining issues: {currentIssuesCount}");
+            Console.WriteLine($"[format] 🔍 Batch {batchIndex}: {batchIssues} issues detected");
 
-            // Step 2: Perform formatting
-            string formatCommand = $"format \"{Path.GetFileName(csprojFile)}\" --exclude-diagnostics IDE0005 --verbosity diagnostic";
-            if (csFiles != null)
-            {
-                formatCommand += " --include " + string.Join(" ", csFiles.Select(f => $"\"{Path.GetRelativePath(parentDir, f)}\""));
-            }
+            // Format для текущего батча
+            string formatCommand = BuildOptimizedFormatCommand(csprojFile, batch, false, maxCpuCount);
             var (formatExitCode, formatOutput, formatError) = RunDotnetCommand(parentDir, formatCommand);
 
-            // Extract changed files from output
             var changedFiles = ExtractChangedFiles(formatOutput);
-            if (changedFiles.Any())
-            {
-                Console.WriteLine($"│ 📝 Modified files: {string.Join(", ", changedFiles.Select(Path.GetFileName))}");
-            }
-            else
-            {
-                Console.WriteLine("│ 📝 No files were modified");
-            }
+            var unfixableIssues = ExtractUnFixableIssues(FilterRustAnalyzerOutput(formatError));
 
-            // Filter out RustAnalyzer noise and extract unfixable issues
-            var filteredFormatError = FilterRustAnalyzerOutput(formatError);
-            if (!string.IsNullOrEmpty(filteredFormatError)) 
-            {
-                var unFixableInThisAttempt = ExtractUnFixableIssues(filteredFormatError);
-                foreach (var issue in unFixableInThisAttempt)
-                {
-                    unFixableIssues.Add(issue);
-                }
-                
-                if (unFixableInThisAttempt.Any())
-                {
-                    Console.WriteLine($"│ ❌ Auto-fix failed: {string.Join(", ", unFixableInThisAttempt)}");
-                    
-                    // Check if unfixable issues are the same as previous attempt
-                    if (attempts > 1 && new HashSet<string>(unFixableInThisAttempt).SetEquals(previousUnFixableIssues))
-                    {
-                        Console.WriteLine("│ ⚠️  Same issues persist - stopping early");
-                        needsFormatting = false;
-                        break;
-                    }
-                    
-                    previousUnFixableIssues = new HashSet<string>(unFixableInThisAttempt);
-                }
-            }
+            allChangedFiles.AddRange(changedFiles);
+            allUnfixableIssues.AddRange(unfixableIssues);
+            totalFixed += Math.Max(0, batchIssues - unfixableIssues.Count);
 
-            Console.WriteLine("└" + new string('─', 50));
+            Console.WriteLine($"[format] 📝 Batch {batchIndex}: {changedFiles.Count} files modified, {unfixableIssues.Count} unfixable");
         }
 
-        // Calculate statistics
-        issuesFixed = Math.Max(0, totalIssuesFound - unFixableIssues.Count);
+        stopwatch.Stop();
 
-        // Final summary
-        Console.WriteLine("\n📋 FORMATTING SUMMARY");
+        // Финальный отчет
+        Console.WriteLine("\n📋 ENHANCED FAST BATCH SUMMARY");
         Console.WriteLine(new string('-', 30));
-        Console.WriteLine($"Total attempts: {attempts}");
-        Console.WriteLine($"Issues found: {totalIssuesFound}");
-        Console.WriteLine($"Issues fixed: {issuesFixed}");
-        Console.WriteLine($"Manual fixes needed: {unFixableIssues.Count}");
+        Console.WriteLine($"Files processed: {processFiles.Length}");
+        Console.WriteLine($"Files excluded: {excludedFiles.Count}");
+        Console.WriteLine($"Batches processed: {batches.Count}");
+        Console.WriteLine($"Files modified: {allChangedFiles.Count}");
+        Console.WriteLine($"Issues found: {totalIssues}");
+        Console.WriteLine($"Issues fixed: {totalFixed}");
+        Console.WriteLine($"Manual fixes needed: {allUnfixableIssues.Count}");
+        Console.WriteLine($"⚡ Time: {stopwatch.Elapsed.TotalSeconds:F1}s");
+        Console.WriteLine($"⚡ Speed: {(processFiles.Length / stopwatch.Elapsed.TotalSeconds):F1} files/second");
 
-        if (needsFormatting && unFixableIssues.Any())
+        if (allChangedFiles.Any())
         {
-            Console.WriteLine($"\n🔧 Requires manual attention:");
-            foreach (var issue in unFixableIssues.OrderBy(x => x))
+            Console.WriteLine($"\n📝 Modified files summary:");
+            foreach (var file in allChangedFiles.Take(10))
+            {
+                Console.WriteLine($"   • {Path.GetFileName(file)}");
+            }
+            if (allChangedFiles.Count > 10)
+            {
+                Console.WriteLine($"   ... and {allChangedFiles.Count - 10} more");
+            }
+        }
+
+        if (allUnfixableIssues.Any())
+        {
+            Console.WriteLine($"\n🔧 Manual fixes needed summary:");
+            var uniqueIssues = allUnfixableIssues.Distinct().Take(5);
+            foreach (var issue in uniqueIssues)
             {
                 Console.WriteLine($"   • {issue}");
             }
+            if (allUnfixableIssues.Distinct().Count() > 5)
+            {
+                Console.WriteLine($"   ... and {allUnfixableIssues.Distinct().Count() - 5} more");
+            }
         }
-        else if (!needsFormatting)
+
+        // Рекомендации по исключенным файлам
+        if (excludedFiles.Any())
         {
-            Console.WriteLine("\n✅ All formatting issues resolved!");
+            Console.WriteLine($"\n💡 RECOMMENDATIONS:");
+            Console.WriteLine($"Consider formatting excluded files individually:");
+            Console.WriteLine($"   dotnet format \"{{csproj}}\" --include \"{{excluded_file}}\" --verbosity minimal");
         }
+    }
+
+    // Фильтрация проблемных файлов
+    private static (string[] processFiles, List<string> excludedFiles) FilterProblematicFiles(string[] csFiles)
+    {
+        var processFiles = new List<string>();
+        var excludedFiles = new List<string>();
+        
+        foreach (var file in csFiles)
+        {
+            try
+            {
+                var fileInfo = new FileInfo(file);
+                var fileName = Path.GetFileName(file).ToLowerInvariant();
+                
+                // Исключаем слишком большие файлы (>1MB)
+                if (fileInfo.Length > 1024 * 1024)
+                {
+                    excludedFiles.Add(file);
+                    continue;
+                }
+                
+                // Исключаем известные проблемные файлы
+                if (fileName.Contains("generated") || 
+                    fileName.Contains(".designer.") ||
+                    fileName.Contains(".g.cs") ||
+                    fileName.EndsWith(".generated.cs"))
+                {
+                    excludedFiles.Add(file);
+                    continue;
+                }
+                
+                // Исключаем файлы в проблемных директориях
+                var dirName = Path.GetDirectoryName(file)?.ToLowerInvariant() ?? "";
+                if (dirName.Contains("obj") || 
+                    dirName.Contains("bin") ||
+                    dirName.Contains("packages"))
+                {
+                    excludedFiles.Add(file);
+                    continue;
+                }
+                
+                processFiles.Add(file);
+            }
+            catch (Exception)
+            {
+                // При ошибке чтения файла - исключаем его
+                excludedFiles.Add(file);
+            }
+        }
+        
+        return (processFiles.ToArray(), excludedFiles);
+    }
+
+    // Создание батчей файлов
+    private static List<string[]> CreateFileBatches(string[] files, int maxBatchSize)
+    {
+        var batches = new List<string[]>();
+        
+        for (int i = 0; i < files.Length; i += maxBatchSize)
+        {
+            var batchSize = Math.Min(maxBatchSize, files.Length - i);
+            var batch = new string[batchSize];
+            Array.Copy(files, i, batch, 0, batchSize);
+            batches.Add(batch);
+        }
+        
+        return batches;
+    }
+
+    // Оптимизированная команда форматирования с дополнительными параметрами
+    private static string BuildOptimizedFormatCommand(string csprojFile, string[] csFiles, bool verifyOnly, int maxCpuCount)
+    {
+        // Максимально упрощенная команда для лучшей производительности
+        var baseCommand = $"format \"{Path.GetFileName(csprojFile)}\" --verbosity quiet";
+        
+        if (verifyOnly)
+        {
+            baseCommand += " --verify-no-changes";
+        }
+
+        // Исключаем некоторые медленные диагностики для ускорения
+        baseCommand += " --exclude IDE0005,IDE0073,IDE0130";
+
+        // Включаем файлы батчем с более коротким синтаксисом
+        if (csFiles.Length > 0)
+        {
+            var relativePaths = csFiles.Select(f => $"\"{Path.GetRelativePath(Path.GetDirectoryName(csprojFile) ?? "", f)}\"");
+            baseCommand += " --include " + string.Join(" ", relativePaths);
+        }
+
+        // Оптимизированные параметры MSBuild
+        baseCommand += $" /maxcpucount:{Math.Min(maxCpuCount, 8)}"; // Ограничиваем чтобы не перегрузить систему
+        baseCommand += " /nologo"; // Убираем логотип для чистоты вывода
+
+        return baseCommand;
     }
 
     private static int CountIssuesInOutput(string output)
@@ -1078,4 +1329,230 @@ public class Program
         process.WaitForExit();
         return (process.ExitCode, output, error);
     }
+
+    // Специальная обработка для очень проблемных плагинов (типа IQChat)
+    static void FormatProblematicPlugin(string parentDir, string csprojFile, string[] csFiles, int maxCpuCount, string pluginName)
+    {
+        Console.WriteLine($"\n⚠️  PROBLEMATIC PLUGIN DETECTED: {pluginName}");
+        Console.WriteLine($"🔧 Applying special optimization strategies...");
+        
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        
+        // Стратегия 1: Разделяем файлы по размеру
+        var (smallFiles, mediumFiles, largeFiles) = CategorizeFilesBySize(csFiles);
+        
+        Console.WriteLine($"[format] 📊 File categorization:");
+        Console.WriteLine($"   Small files (<10KB): {smallFiles.Length}");
+        Console.WriteLine($"   Medium files (10KB-100KB): {mediumFiles.Length}");
+        Console.WriteLine($"   Large files (>100KB): {largeFiles.Length}");
+        
+        int totalProcessed = 0;
+        int totalModified = 0;
+        var allErrors = new List<string>();
+        
+        // Обрабатываем маленькие файлы батчами
+        if (smallFiles.Any())
+        {
+            Console.WriteLine($"\n[format] 🔄 Processing small files in batches...");
+            var result = ProcessFileCategory(parentDir, csprojFile, smallFiles, maxCpuCount, "small", 100);
+            totalProcessed += result.processed;
+            totalModified += result.modified;
+            allErrors.AddRange(result.errors);
+        }
+        
+        // Обрабатываем средние файлы меньшими батчами
+        if (mediumFiles.Any())
+        {
+            Console.WriteLine($"\n[format] 🔄 Processing medium files in smaller batches...");
+            var result = ProcessFileCategory(parentDir, csprojFile, mediumFiles, maxCpuCount, "medium", 25);
+            totalProcessed += result.processed;
+            totalModified += result.modified;
+            allErrors.AddRange(result.errors);
+        }
+        
+        // Обрабатываем большие файлы по одному
+        if (largeFiles.Any())
+        {
+            Console.WriteLine($"\n[format] 🔄 Processing large files individually...");
+            var result = ProcessLargeFilesIndividually(parentDir, csprojFile, largeFiles, maxCpuCount);
+            totalProcessed += result.processed;
+            totalModified += result.modified;
+            allErrors.AddRange(result.errors);
+        }
+        
+        stopwatch.Stop();
+        
+        // Финальный отчет для проблемного плагина
+        Console.WriteLine($"\n📋 PROBLEMATIC PLUGIN SUMMARY ({pluginName})");
+        Console.WriteLine(new string('=', 50));
+        Console.WriteLine($"Files processed: {totalProcessed}");
+        Console.WriteLine($"Files modified: {totalModified}");
+        Console.WriteLine($"Unique errors: {allErrors.Distinct().Count()}");
+        Console.WriteLine($"⚡ Total time: {stopwatch.Elapsed.TotalSeconds:F1}s");
+        Console.WriteLine($"⚡ Avg speed: {(totalProcessed / stopwatch.Elapsed.TotalSeconds):F1} files/second");
+        
+        if (allErrors.Any())
+        {
+            Console.WriteLine($"\n🔧 Most common issues:");
+            var topErrors = allErrors.GroupBy(e => e)
+                                   .OrderByDescending(g => g.Count())
+                                   .Take(5);
+            foreach (var error in topErrors)
+            {
+                Console.WriteLine($"   • {error.Key} ({error.Count()} times)");
+            }
+        }
+        
+        Console.WriteLine($"\n💡 Recommendation for {pluginName}:");
+        Console.WriteLine($"   Consider refactoring large files into smaller components");
+        Console.WriteLine($"   for better code formatting performance and maintainability.");
+    }
+    
+    // Категоризация файлов по размеру
+    private static (string[] small, string[] medium, string[] large) CategorizeFilesBySize(string[] csFiles)
+    {
+        var small = new List<string>();
+        var medium = new List<string>();
+        var large = new List<string>();
+        
+        foreach (var file in csFiles)
+        {
+            try
+            {
+                var fileInfo = new FileInfo(file);
+                if (fileInfo.Length < 10 * 1024) // < 10KB
+                    small.Add(file);
+                else if (fileInfo.Length < 100 * 1024) // < 100KB
+                    medium.Add(file);
+                else
+                    large.Add(file);
+            }
+            catch
+            {
+                // При ошибке считаем файл средним
+                medium.Add(file);
+            }
+        }
+        
+        return (small.ToArray(), medium.ToArray(), large.ToArray());
+    }
+    
+    // Обработка категории файлов
+    private static (int processed, int modified, List<string> errors) ProcessFileCategory(
+        string parentDir, string csprojFile, string[] files, int maxCpuCount, string category, int batchSize)
+    {
+        var batches = CreateFileBatches(files, batchSize);
+        int processed = 0;
+        int modified = 0;
+        var errors = new List<string>();
+        
+        foreach (var (batch, index) in batches.Select((b, i) => (b, i + 1)))
+        {
+            Console.WriteLine($"   Processing {category} batch {index}/{batches.Count} ({batch.Length} files)...");
+            
+            try
+            {
+                // Используем урезанную команду для проблемных файлов
+                var command = BuildMinimalFormatCommand(csprojFile, batch, maxCpuCount);
+                var (exitCode, output, error) = RunDotnetCommand(parentDir, command);
+                
+                processed += batch.Length;
+                var changedFiles = ExtractChangedFiles(output);
+                modified += changedFiles.Count;
+                
+                var batchErrors = ExtractUnFixableIssues(error);
+                errors.AddRange(batchErrors);
+                
+                Console.WriteLine($"     ✅ Batch {index}: {changedFiles.Count} files changed");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"     ❌ Batch {index} failed: {ex.Message}");
+                errors.Add($"Batch error: {ex.Message}");
+            }
+        }
+        
+        return (processed, modified, errors);
+    }
+    
+    // Обработка больших файлов индивидуально
+    private static (int processed, int modified, List<string> errors) ProcessLargeFilesIndividually(
+        string parentDir, string csprojFile, string[] largeFiles, int maxCpuCount)
+    {
+        int processed = 0;
+        int modified = 0;
+        var errors = new List<string>();
+        
+        foreach (var (file, index) in largeFiles.Select((f, i) => (f, i + 1)))
+        {
+            Console.WriteLine($"   Processing large file {index}/{largeFiles.Length}: {Path.GetFileName(file)}...");
+            
+            try
+            {
+                // Для больших файлов используем самую минимальную команду
+                var command = BuildSuperMinimalFormatCommand(csprojFile, file, maxCpuCount);
+                var (exitCode, output, error) = RunDotnetCommand(parentDir, command);
+                
+                processed++;
+                var changedFiles = ExtractChangedFiles(output);
+                if (changedFiles.Any())
+                {
+                    modified++;
+                    Console.WriteLine($"     ✅ Modified: {Path.GetFileName(file)}");
+                }
+                
+                var fileErrors = ExtractUnFixableIssues(error);
+                if (fileErrors.Any())
+                {
+                    errors.AddRange(fileErrors);
+                    Console.WriteLine($"     ⚠️  {fileErrors.Count} unfixable issues");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"     ❌ Failed: {ex.Message}");
+                errors.Add($"Large file error: {ex.Message}");
+            }
+        }
+        
+        return (processed, modified, errors);
+    }
+    
+    // Минимальная команда форматирования
+    private static string BuildMinimalFormatCommand(string csprojFile, string[] csFiles, int maxCpuCount)
+    {
+        var baseCommand = $"format \"{Path.GetFileName(csprojFile)}\" --verbosity quiet --no-restore";
+        
+        // Исключаем самые тяжелые диагностики
+        baseCommand += " --exclude IDE0005,IDE0073,IDE0130,IDE0160,IDE0161";
+        
+        if (csFiles.Length > 0)
+        {
+            var relativePaths = csFiles.Select(f => $"\"{Path.GetRelativePath(Path.GetDirectoryName(csprojFile) ?? "", f)}\"");
+            baseCommand += " --include " + string.Join(" ", relativePaths);
+        }
+        
+        // Минимальный параллелизм для нестабильных файлов
+        baseCommand += $" /maxcpucount:{Math.Min(maxCpuCount / 2, 4)} /nologo";
+        
+        return baseCommand;
+    }
+    
+    // Супер минимальная команда для отдельных больших файлов
+    private static string BuildSuperMinimalFormatCommand(string csprojFile, string csFile, int maxCpuCount)
+    {
+        var baseCommand = $"format \"{Path.GetFileName(csprojFile)}\" --verbosity quiet --no-restore";
+        
+        // Исключаем все тяжелые диагностики
+        baseCommand += " --exclude IDE0005,IDE0073,IDE0130,IDE0160,IDE0161,IDE0290,IDE0300";
+        
+        var relativePath = Path.GetRelativePath(Path.GetDirectoryName(csprojFile) ?? "", csFile);
+        baseCommand += $" --include \"{relativePath}\"";
+        
+        // Однопоточный режим для стабильности
+        baseCommand += " /maxcpucount:1 /nologo";
+        
+        return baseCommand;
+    }
 }
+
