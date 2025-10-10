@@ -1516,8 +1516,7 @@ public class Program
         }
 
         // Исключаем некоторые медленные диагностики для ускорения
-        baseCommand += " --exclude IDE0005,IDE0073,IDE0130";
-        baseCommand += " --exclude-diagnostics SMB001 SMB002 SMB003 SMB004 SMB005";
+        baseCommand += " --exclude-diagnostics IDE0005 IDE0073 IDE0130 SMB001 SMB002 SMB003 SMB004 SMB005";
 
         // Включаем файлы батчем с более коротким синтаксисом
         if (csFiles.Length > 0)
@@ -1824,8 +1823,7 @@ public class Program
         var baseCommand = $"format \"{Path.GetFileName(csprojFile)}\" --verbosity quiet --no-restore";
         
         // Исключаем самые тяжелые диагностики
-        baseCommand += " --exclude IDE0005,IDE0073,IDE0130,IDE0160,IDE0161";
-        baseCommand += " --exclude-diagnostics SMB001 SMB002 SMB003 SMB004 SMB005";
+        baseCommand += " --exclude-diagnostics IDE0005 IDE0073 IDE0130 IDE0160 IDE0161 SMB001 SMB002 SMB003 SMB004 SMB005";
         
         if (csFiles.Length > 0)
         {
@@ -1845,8 +1843,7 @@ public class Program
         var baseCommand = $"format \"{Path.GetFileName(csprojFile)}\" --verbosity quiet --no-restore";
         
         // Исключаем все тяжелые диагностики
-        baseCommand += " --exclude IDE0005,IDE0073,IDE0130,IDE0160,IDE0161,IDE0290,IDE0300";
-        baseCommand += " --exclude-diagnostics SMB001 SMB002 SMB003 SMB004 SMB005";
+        baseCommand += " --exclude-diagnostics IDE0005 IDE0073 IDE0130 IDE0160 IDE0161 IDE0290 IDE0300 SMB001 SMB002 SMB003 SMB004 SMB005";
         
         var relativePath = Path.GetRelativePath(Path.GetDirectoryName(csprojFile) ?? "", csFile);
         baseCommand += $" --include \"{relativePath}\"";
