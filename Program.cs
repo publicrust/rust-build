@@ -72,6 +72,8 @@ public class ConcurrentStats
             _totalIssuesFixed += stats.IssuesFixed;
         }
     }
+
+
 }
 
 public class Program
@@ -155,6 +157,7 @@ public class Program
 
         // --- ДОБАВЛЕНО: запуск форматирования ДО анализа ---
         string? pluginsDirForFormat = null;
+        bool pluginStructureValidated = false;
         if (projectPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
         {
             var csprojDir = Path.GetDirectoryName(projectPath);
@@ -183,6 +186,12 @@ public class Program
         }
         if (pluginsDirForFormat != null)
         {
+            if (!ValidatePluginStructure(pluginsDirForFormat, pluginName))
+            {
+                _hasErrors = true;
+                return;
+            }
+            pluginStructureValidated = true;
             RunDotnetFormat(pluginsDirForFormat, pluginName);
         }
         // --- КОНЕЦ ДОБАВЛЕНИЯ ---
@@ -287,6 +296,12 @@ public class Program
                     Console.WriteLine($"Error: 'plugins' directory not found in {Path.GetFullPath(path)}");
                     return;
                 }
+                if (!pluginStructureValidated && !ValidatePluginStructure(pluginsDir, pluginName))
+                {
+                    _hasErrors = true;
+                    return;
+                }
+                pluginStructureValidated = true;
                 var pluginProjects = Directory.GetFiles(pluginsDir, "*.csproj", SearchOption.AllDirectories);
                 if (pluginProjects.Length == 0)
                 {
@@ -354,6 +369,12 @@ public class Program
                 Console.WriteLine($"Error: 'plugins' directory not found next to {path}");
                 return;
             }
+            if (!pluginStructureValidated && !ValidatePluginStructure(pluginsDir, pluginName))
+            {
+                _hasErrors = true;
+                return;
+            }
+            pluginStructureValidated = true;
             // Продолжаем обычный анализ — diagnostics уже фильтруются по plugins
         }
         else if (path != null && !File.Exists(path))
@@ -1330,6 +1351,94 @@ public class Program
         }
         
         return (false, "Normal plugin");
+    }
+
+    private static bool ValidatePluginStructure(string pluginsDir, string? specificPluginName)
+    {
+        try
+        {
+            var topLevelCsFiles = Directory.GetFiles(pluginsDir, "*.cs", SearchOption.TopDirectoryOnly);
+
+            if (!string.IsNullOrEmpty(specificPluginName))
+            {
+                var matchingPluginDir = Directory.GetDirectories(pluginsDir, "*", SearchOption.AllDirectories)
+                    .FirstOrDefault(d => Path.GetFileName(d).Equals(specificPluginName, StringComparison.OrdinalIgnoreCase));
+
+                if (matchingPluginDir == null)
+                {
+                    var misplacedFiles = topLevelCsFiles
+                        .Where(f => Path.GetFileName(f).StartsWith(specificPluginName, StringComparison.OrdinalIgnoreCase))
+                        .ToList();
+
+                    if (misplacedFiles.Any())
+                    {
+                        PrintMisplacedPluginFilesMessage(pluginsDir, specificPluginName, misplacedFiles);
+                        _hasErrors = true;
+                        return false;
+                    }
+
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"❌ Plugin '{specificPluginName}' was not found under '{pluginsDir}'.");
+                    Console.WriteLine("   Expected structure:");
+                    Console.WriteLine($"     plugins/{specificPluginName}/{specificPluginName}.cs");
+                    Console.WriteLine("   Create the folder and move the plugin files into it, then rerun rust-build.");
+                    Console.ResetColor();
+                    _hasErrors = true;
+                    return false;
+                }
+            }
+
+            if (topLevelCsFiles.Any())
+            {
+                PrintGeneralMisplacedFilesMessage(pluginsDir, topLevelCsFiles);
+                _hasErrors = true;
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Could not validate plugin layout: {ex.Message}");
+        }
+
+        return true;
+    }
+
+    private static void PrintMisplacedPluginFilesMessage(string pluginsDir, string pluginName, List<string> misplacedFiles)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"❌ Plugin '{pluginName}' is placed directly under '{pluginsDir}'.");
+        Console.WriteLine("   Each plugin must live inside its own folder:");
+        Console.WriteLine($"     plugins/{pluginName}/{pluginName}.cs");
+        Console.WriteLine("   Move the following files into that folder and rerun the command:");
+        foreach (var file in misplacedFiles.Take(5))
+        {
+            Console.WriteLine($"     • {Path.GetFileName(file)}");
+        }
+        if (misplacedFiles.Count > 5)
+        {
+            Console.WriteLine($"     ... and {misplacedFiles.Count - 5} more");
+        }
+        Console.WriteLine("   Example fix:");
+        Console.WriteLine($"     mkdir -p plugins/{pluginName} && mv plugins/{pluginName}*.cs plugins/{pluginName}/");
+        Console.ResetColor();
+    }
+
+    private static void PrintGeneralMisplacedFilesMessage(string pluginsDir, string[] topLevelCsFiles)
+    {
+        Console.ForegroundColor = ConsoleColor.Red;
+        Console.WriteLine($"❌ Invalid plugin layout detected in '{pluginsDir}'.");
+        Console.WriteLine("   Found C# files directly under 'plugins/'. Move each plugin into its own folder:");
+        Console.WriteLine("     plugins/<PluginName>/<PluginName>.cs");
+        Console.WriteLine("   Files that must be moved:");
+        foreach (var file in topLevelCsFiles.Take(5))
+        {
+            Console.WriteLine($"     • {Path.GetFileName(file)}");
+        }
+        if (topLevelCsFiles.Length > 5)
+        {
+            Console.WriteLine($"     ... and {topLevelCsFiles.Length - 5} more");
+        }
+        Console.ResetColor();
     }
 
     // Быстрое форматирование одним пакетом с продвинутой оптимизацией
