@@ -560,22 +560,11 @@ public class Program
             })
             .ToList();
 
-        // Считаем ошибки по каждому плагину
-        foreach (var diag in filteredDiagnostics.Where(d => d.Severity == DiagnosticSeverity.Error))
-        {
-            var filePath = diag.Location.SourceTree?.FilePath;
-            if (filePath == null || string.IsNullOrEmpty(_pluginsRoot)) continue;
-            var idx = filePath.IndexOf(Path.DirectorySeparatorChar + "plugins" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
-            if (idx < 0) continue;
-            var relative = filePath.Substring(idx + ("/plugins/".Length));
-            var pluginName = relative.Split(Path.DirectorySeparatorChar)[0];
-            if (!_pluginErrorCount.ContainsKey(pluginName)) _pluginErrorCount[pluginName] = 0;
-            _pluginErrorCount[pluginName]++;
-        }
-
         // Применяем логику приоритетов
-        var issueFound = false;
         var sortedLevels = _config.PriorityLevels.OrderBy(p => p.Level).ToList();
+        var prioritizedRuleIds = new HashSet<string>(sortedLevels.SelectMany(p => p.Rules));
+        var diagnosticsForDisplay = new List<Diagnostic>();
+        string? activeLevelLabel = null;
 
         foreach (var level in sortedLevels)
         {
@@ -586,33 +575,61 @@ public class Program
 
             if (levelDiagnostics.Any())
             {
-                Console.WriteLine($"\nDisplaying issues for Level {level.Level}: {level.Name}");
-                DisplayDiagnostics(levelDiagnostics);
-                issueFound = true;
-                break; 
+                diagnosticsForDisplay = levelDiagnostics;
+                activeLevelLabel = $"Level {level.Level}: {level.Name}";
+                break;
             }
         }
         
         // Show remaining errors if no priority groups were found
-        if (!issueFound)
+        if (!diagnosticsForDisplay.Any())
         {
             var unprioritizedDiagnostics = filteredDiagnostics
-                .Where(d => !_config.PriorityLevels.SelectMany(p => p.Rules).Contains(d.Id))
+                .Where(d => !prioritizedRuleIds.Contains(d.Id))
                 .OrderByDescending(d => d.Severity)
                 .ToList();
             
             if (unprioritizedDiagnostics.Any())
             {
-                Console.WriteLine($"\nDisplaying issues for Level {sortedLevels.Count}");
-                DisplayDiagnostics(unprioritizedDiagnostics);
-                issueFound = true;
+                diagnosticsForDisplay = unprioritizedDiagnostics;
+                activeLevelLabel = sortedLevels.Any()
+                    ? $"Level {sortedLevels.Count + 1}: Unprioritized diagnostics"
+                    : "Diagnostics";
             }
+        }
+        var issueFound = diagnosticsForDisplay.Any();
+        var suppressedCount = Math.Max(0, filteredDiagnostics.Count - diagnosticsForDisplay.Count);
+
+        if (issueFound)
+        {
+            if (!string.IsNullOrEmpty(activeLevelLabel))
+            {
+                Console.WriteLine($"\nDisplaying issues for {activeLevelLabel}");
+            }
+            if (suppressedCount > 0)
+            {
+                Console.WriteLine($"  (Filtered out {suppressedCount} lower-priority diagnostics)");
+            }
+            DisplayDiagnostics(diagnosticsForDisplay);
         }
 
         // Count all errors for the summary
-        var totalErrors = filteredDiagnostics.Count(d => d.Severity == DiagnosticSeverity.Error);
-        var totalWarnings = filteredDiagnostics.Count(d => d.Severity == DiagnosticSeverity.Warning);
+        var totalErrors = diagnosticsForDisplay.Count(d => d.Severity == DiagnosticSeverity.Error);
+        var totalWarnings = diagnosticsForDisplay.Count(d => d.Severity == DiagnosticSeverity.Warning);
         Console.WriteLine($"\nTotal: {totalErrors} errors, {totalWarnings} warnings.");
+
+        // Считаем ошибки по каждому плагину только для отображаемого набора
+        foreach (var diag in diagnosticsForDisplay.Where(d => d.Severity == DiagnosticSeverity.Error))
+        {
+            var filePath = diag.Location.SourceTree?.FilePath;
+            if (filePath == null || string.IsNullOrEmpty(_pluginsRoot)) continue;
+            var idx = filePath.IndexOf(Path.DirectorySeparatorChar + "plugins" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) continue;
+            var relative = filePath.Substring(idx + ("/plugins/".Length));
+            var pluginName = relative.Split(Path.DirectorySeparatorChar)[0];
+            if (!_pluginErrorCount.ContainsKey(pluginName)) _pluginErrorCount[pluginName] = 0;
+            _pluginErrorCount[pluginName]++;
+        }
 
         return (issueFound, issueFound);
     }
