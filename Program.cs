@@ -88,6 +88,7 @@ public class Program
         // Обработка аргументов: путь до .csproj и имя плагина
         string? projectPath = null;
         string? pluginName = null;
+        string? configOverridePath = null;
         
         // Обработка аргумента --project
         int projectArgIndex = Array.IndexOf(args, "--project");
@@ -100,6 +101,23 @@ public class Program
             for (int i = 0; i < args.Length; i++)
             {
                 if (i != projectArgIndex && i != projectArgIndex + 1)
+                {
+                    newArgs.Add(args[i]);
+                }
+            }
+            args = newArgs.ToArray();
+        }
+        
+        // Обработка аргумента --config
+        int configArgIndex = Array.IndexOf(args, "--config");
+        if (configArgIndex >= 0 && configArgIndex + 1 < args.Length)
+        {
+            configOverridePath = args[configArgIndex + 1];
+
+            var newArgs = new List<string>();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (i != configArgIndex && i != configArgIndex + 1)
                 {
                     newArgs.Add(args[i]);
                 }
@@ -201,6 +219,27 @@ public class Program
             // Определяем путь к конфигу: сначала в директории проекта, затем fallback
             string? configPath = null;
             
+            // 0. Если путь к конфигу задан через аргумент, используем его
+            if (!string.IsNullOrWhiteSpace(configOverridePath))
+            {
+                try
+                {
+                    var absolutePath = Path.GetFullPath(configOverridePath);
+                    if (File.Exists(absolutePath))
+                    {
+                        configPath = absolutePath;
+                    }
+                    else
+                    {
+                        Console.WriteLine($"Warning: Specified config file '{absolutePath}' not found. Falling back to default search.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Warning: Could not resolve config path '{configOverridePath}'. Falling back to default search. Error: {ex.Message}");
+                }
+            }
+
             // 1. Если указан путь к проекту/решению, ищем конфиг рядом с ним
             if (projectPath != null)
             {
@@ -589,9 +628,25 @@ public class Program
 
         foreach (var level in sortedLevels)
         {
+            if (level.Rules == null || level.Rules.Count == 0)
+            {
+                continue;
+            }
+
+            var ruleOrder = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < level.Rules.Count; i++)
+            {
+                var ruleId = level.Rules[i];
+                if (string.IsNullOrWhiteSpace(ruleId)) continue;
+                ruleOrder[ruleId] = i;
+            }
+
             var levelDiagnostics = filteredDiagnostics
-                .Where(d => level.Rules.Contains(d.Id))
-                .OrderByDescending(d => d.Severity)
+                .Select((diagnostic, index) => new { diagnostic, index })
+                .Where(x => ruleOrder.ContainsKey(x.diagnostic.Id))
+                .OrderBy(x => ruleOrder[x.diagnostic.Id])
+                .ThenBy(x => x.index)
+                .Select(x => x.diagnostic)
                 .ToList();
 
             if (levelDiagnostics.Any())
@@ -607,15 +662,14 @@ public class Program
         {
             var unprioritizedDiagnostics = filteredDiagnostics
                 .Where(d => !prioritizedRuleIds.Contains(d.Id))
-                .OrderByDescending(d => d.Severity)
                 .ToList();
             
             if (unprioritizedDiagnostics.Any())
             {
                 diagnosticsForDisplay = unprioritizedDiagnostics;
                 activeLevelLabel = sortedLevels.Any()
-                    ? $"Level {sortedLevels.Count + 1}: Unprioritized diagnostics"
-                    : "Diagnostics";
+                    ? "Level 1: Critical Compiler Errors"
+                    : "Critical Compiler Errors";
             }
         }
         var issueFound = diagnosticsForDisplay.Any();

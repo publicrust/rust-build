@@ -8,7 +8,7 @@
     <PackAsTool>true</PackAsTool>
     <ToolCommandName>rust-build</ToolCommandName>
     <PackageId>rust-build</PackageId>
-    <Version>1.8.4</Version>
+    <Version>1.8.5</Version>
     <Authors>publicrust</Authors>
     <Description>Static analyzer for Rust plugins in C# projects. Only analyzes files in plugins/. Includes advanced dotnet format functionality with dynamic problematic plugin detection and configurable optimization thresholds.</Description>
     <PackageTags>analyzer;rust;oxide;plugins;tool;format;agi</PackageTags>
